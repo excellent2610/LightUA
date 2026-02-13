@@ -26,6 +26,18 @@ def _collect_off_lines(intervals: list[Any]) -> list[str]:
     return lines
 
 
+def _collect_on_lines(intervals: list[Any]) -> list[str]:  # added
+    lines: list[str] = []
+    for item in intervals or []:
+        start, end, status = _interval_parts(item)
+        if str(status).upper() != "ON":
+            continue
+        if not start or not end:
+            continue
+        lines.append(f"{start} – {end}")
+    return lines
+
+
 def is_valid_queue(value: Any) -> bool:
     """Legacy compatibility validator used by handlers."""
     if value is None:
@@ -39,7 +51,16 @@ def is_valid_queue(value: Any) -> bool:
 def format_off_message(intervals: list[Any], city: str = "Черкаси") -> str:
     lines = _collect_off_lines(intervals)
     if not lines:
-        return "🟢 Сьогодні відключень не заплановано"
+        return "🟢 СЬОГОДНІ ВІДКЛЮЧЕНЬ НЕМАЄ"  # modified
+
+    body = "\n".join(lines)
+    return f"🟢 СВІТЛО Є ({city})\n\n{body}\n\nДжерело: {SOURCE_LABEL}"
+
+
+def format_on_message(intervals: list[Any], city: str = "Черкаси") -> str:  # added
+    lines = _collect_on_lines(intervals)
+    if not lines:
+        return "🔴 СВІТЛА СЬОГОДНІ НЕ БУДЕ"
 
     body = "\n".join(lines)
     return f"🔴 ВІДКЛЮЧЕННЯ СВІТЛА ({city})\n\n{body}\n\nДжерело: {SOURCE_LABEL}"

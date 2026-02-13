@@ -9,7 +9,7 @@ from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
-from bot.formatters import format_off_message
+from bot.formatters import format_off_message, format_on_message  # modified
 from core import parser as schedule_parser
 
 router = Router()
@@ -44,17 +44,18 @@ def _collect_intervals(node: Any) -> list[dict[str, str]]:
     return result
 
 
-def _dedupe_off(intervals: list[dict[str, str]]) -> list[dict[str, str]]:
+def _dedupe_intervals(intervals: list[dict[str, str]]) -> list[dict[str, str]]:  # added
     seen: set[tuple[str, str, str]] = set()
     out: list[dict[str, str]] = []
     for it in intervals:
-        if str(it.get("status", "")).upper() != "OFF":
+        status = str(it.get("status", "")).upper()
+        if status not in {"OFF", "ON"}:
             continue
-        key = (str(it.get("start", "")), str(it.get("end", "")), "OFF")
+        key = (str(it.get("start", "")), str(it.get("end", "")), status)
         if key in seen:
             continue
         seen.add(key)
-        out.append({"start": key[0], "end": key[1], "status": "OFF"})
+        out.append({"start": key[0], "end": key[1], "status": status})
     return out
 
 
@@ -68,7 +69,7 @@ def _extract_for_queue_subqueue(data: Any, queue: str, subqueue: str) -> list[di
             and str(x.get("subqueue", "")).strip() == subqueue
         ]
         if tagged:
-            return _dedupe_off(_collect_intervals(tagged))
+            return _dedupe_intervals(_collect_intervals(tagged))  # modified
 
     # Best-effort matching in nested JSON.
     targets = {f"{queue}.{subqueue}", f"{queue}-{subqueue}", f"{queue}_{subqueue}", f"{queue}{subqueue}"}
@@ -98,10 +99,78 @@ def _extract_for_queue_subqueue(data: Any, queue: str, subqueue: str) -> list[di
 
     walk(data)
     if matched_nodes:
-        found = _dedupe_off(_collect_intervals(matched_nodes))
+        found = _dedupe_intervals(_collect_intervals(matched_nodes))  # modified
         if found:
             return found
     return []
+
+
+def _to_minutes(value: str) -> int | None:  # added
+    try:
+        hh, mm = value.split(":", 1)
+        h = int(hh)
+        m = int(mm)
+    except Exception:
+        return None
+    if h == 24 and m == 0:
+        return 24 * 60
+    if 0 <= h <= 23 and 0 <= m <= 59:
+        return h * 60 + m
+    return None
+
+
+def _to_hhmm(total_minutes: int) -> str:  # added
+    if total_minutes <= 0:
+        return "00:00"
+    if total_minutes >= 24 * 60:
+        return "24:00"
+    return f"{total_minutes // 60:02d}:{total_minutes % 60:02d}"
+
+
+def _split_off_on_intervals(intervals: list[dict[str, str]]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:  # added
+    off_intervals: list[dict[str, str]] = []
+    on_intervals: list[dict[str, str]] = []
+
+    for it in intervals:
+        status = str(it.get("status", "")).upper()
+        if status == "OFF":
+            off_intervals.append({"start": str(it.get("start", "")), "end": str(it.get("end", "")), "status": "OFF"})
+        elif status == "ON":
+            on_intervals.append({"start": str(it.get("start", "")), "end": str(it.get("end", "")), "status": "ON"})
+
+    # If parser returned only OFF, build ON as complement for 00:00-24:00.  # added
+    if on_intervals:
+        return _dedupe_intervals(off_intervals), _dedupe_intervals(on_intervals)
+
+    off_ranges: list[tuple[int, int]] = []
+    for it in off_intervals:
+        start_m = _to_minutes(it["start"])
+        end_m = _to_minutes(it["end"])
+        if start_m is None or end_m is None or start_m >= end_m:
+            continue
+        off_ranges.append((start_m, end_m))
+
+    if not off_ranges:
+        return [], [{"start": "00:00", "end": "24:00", "status": "ON"}]
+
+    off_ranges.sort()
+    merged: list[tuple[int, int]] = []
+    for start_m, end_m in off_ranges:
+        if not merged or start_m > merged[-1][1]:
+            merged.append((start_m, end_m))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end_m))
+
+    cursor = 0
+    inferred_on: list[dict[str, str]] = []
+    for start_m, end_m in merged:
+        if cursor < start_m:
+            inferred_on.append({"start": _to_hhmm(cursor), "end": _to_hhmm(start_m), "status": "ON"})
+        cursor = max(cursor, end_m)
+    if cursor < 24 * 60:
+        inferred_on.append({"start": _to_hhmm(cursor), "end": "24:00", "status": "ON"})
+
+    return _dedupe_intervals(off_intervals), inferred_on
 
 
 async def _load_schedule_data() -> Any:
@@ -224,7 +293,10 @@ async def on_text(message: Message) -> None:
 
             data = await asyncio.wait_for(_load_schedule_data(), timeout=35)
             intervals = _extract_for_queue_subqueue(data, queue, subqueue)
-            await message.answer(format_off_message(intervals, city=f"Черкаси · {queue}.{subqueue}"))
+            off_intervals, on_intervals = _split_off_on_intervals(intervals)  # added
+            city_label = f"Черкаси · {queue}.{subqueue}"  # added
+            await message.answer(format_off_message(off_intervals, city=city_label))  # modified
+            await message.answer(format_on_message(on_intervals, city=city_label))  # added
             _USER_STATE.pop(user_id, None)
             return
 

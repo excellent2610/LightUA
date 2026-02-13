@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 import requests
+from bs4 import BeautifulSoup  # added
 
 ALERTS_URL = "https://alerts.org.ua/cherkaska-oblast/cherkasy/"
 
@@ -18,9 +19,37 @@ _QUEUE_RE = re.compile(
     re.IGNORECASE,
 )
 _QUEUE_DOTTED_RE = re.compile(r"\b([1-6])\s*[\.\-]\s*([1-2])\b")
+_GROUP_LINE_RE = re.compile(r"(?:група|group|черга|queue)\s*([1-6])\s*[\.\-]\s*([1-2])", re.IGNORECASE)  # modified
 
-_OFF_HINTS = (" off", "red", "danger", "blackout", "вимк", "відключ", "без світла")
-_ON_HINTS = (" on", "green", "success", "увімк", "є світло")
+_OFF_HINTS = (  # modified
+    " off",
+    "red",
+    "danger",
+    "text-red",
+    "bg-red",
+    "text-danger",
+    "bg-danger",
+    "blackout",
+    "outage",
+    "вимк",
+    "відключ",
+    "без світла",
+    "немає світла",
+)
+_ON_HINTS = (  # modified
+    " on",
+    "green",
+    "success",
+    "text-green",
+    "bg-green",
+    "text-success",
+    "bg-success",
+    "увімк",
+    "вкл",
+    "є світло",
+    "зі світлом",
+    "наявне світло",
+)
 
 
 def _normalize_time(value: str) -> str:
@@ -43,17 +72,38 @@ def build_schedule_url(*args: Any, **kwargs: Any) -> str:
     return ALERTS_URL
 
 
-def _status_from_context(explicit_status: str | None, context: str) -> str:
+def _status_from_context(explicit_status: str | None, context: str) -> str:  # modified
     if explicit_status:
         return explicit_status.upper()
 
     ctx = f" {context.lower()} "
-    if any(h in ctx for h in _OFF_HINTS):
+    off_hit = any(h in ctx for h in _OFF_HINTS)
+    on_hit = any(h in ctx for h in _ON_HINTS)
+    if off_hit and not on_hit:
         return "OFF"
-    if any(h in ctx for h in _ON_HINTS):
+    if on_hit and not off_hit:
         return "ON"
-    # Fallback when status is not explicit in text but only encoded visually.
-    return "OFF"
+    if off_hit and on_hit:
+        center = len(ctx) // 2  # added
+
+        def nearest_distance(hints: tuple[str, ...]) -> int:  # added
+            best = 10**9
+            for hint in hints:
+                pos = ctx.find(hint)
+                while pos != -1:
+                    dist = abs(pos - center)
+                    if dist < best:
+                        best = dist
+                    pos = ctx.find(hint, pos + 1)
+            return best
+
+        off_dist = nearest_distance(_OFF_HINTS)  # added
+        on_dist = nearest_distance(_ON_HINTS)  # added
+        if off_dist < on_dist:
+            return "OFF"
+        if on_dist < off_dist:
+            return "ON"
+    return "UNKNOWN"
 
 
 def _queue_from_context(context: str) -> tuple[str | None, str | None]:
@@ -74,43 +124,104 @@ def _queue_from_context(context: str) -> tuple[str | None, str | None]:
 
 def _extract_blocks(raw_html: str) -> list[dict[str, str]]:
     blocks: list[dict[str, str]] = []
-    current_queue: str | None = None
-    current_subqueue: str | None = None
-    cursor = 0
 
     for m in _TIME_BLOCK_RE.finditer(raw_html):
-        # Carry queue context from previous HTML slice to reduce empty queue/subqueue fields.
-        prefix = raw_html[cursor:m.start()]
-        q_pref, sq_pref = _queue_from_context(prefix[-1200:])
-        if q_pref:
-            current_queue = q_pref
-        if sq_pref:
-            current_subqueue = sq_pref
-
-        start_i = max(m.start() - 450, 0)
-        end_i = min(m.end() + 180, len(raw_html))
+        start_i = max(m.start() - 260, 0)  # modified
+        end_i = min(m.end() + 220, len(raw_html))  # modified
         context = raw_html[start_i:end_i]
         status = _status_from_context(m.group("status"), context)
-        if status != "OFF":
-            cursor = m.end()
+        if status not in {"OFF", "ON"}:  # modified
             continue
 
+        # Prefer queue marker closest to interval block; do not carry stale queue across page.  # added
         queue, subqueue = _queue_from_context(context)
-        if queue:
-            current_queue = queue
-        if subqueue:
-            current_subqueue = subqueue
+        if not queue or not subqueue:
+            continue
 
         blocks.append(
             {
                 "start": _normalize_time(m.group("start")),
                 "end": _normalize_time(m.group("end")),
-                "status": "OFF",
-                "queue": current_queue or "",
-                "subqueue": current_subqueue or "",
+                "status": status,  # modified
+                "queue": queue,
+                "subqueue": subqueue,
             }
         )
-        cursor = m.end()
+
+    seen: set[tuple[str, str, str, str, str]] = set()
+    unique: list[dict[str, str]] = []
+    for b in blocks:
+        key = (b["start"], b["end"], b["status"], b["queue"], b["subqueue"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(b)
+    return unique
+
+
+def _extract_blocks_from_text(raw_html: str) -> list[dict[str, str]]:  # added
+    soup = BeautifulSoup(raw_html, "html.parser")
+    text = soup.get_text("\n", strip=True)
+    if not text:
+        return []
+
+    blocks: list[dict[str, str]] = []
+    current_queue: str | None = None
+    current_subqueue: str | None = None
+    current_status: str | None = None  # added
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        g = _GROUP_LINE_RE.search(line)
+        if g:
+            current_queue, current_subqueue = g.group(1), g.group(2)
+            continue
+        # Support headings that may contain only dotted queue format like "4.1".  # added
+        g2 = _QUEUE_DOTTED_RE.search(line)
+        if g2 and len(line) <= 20:
+            current_queue, current_subqueue = g2.group(1), g2.group(2)
+            continue
+        q3, sq3 = _queue_from_context(line)
+        if q3 and sq3 and len(line) <= 40:
+            current_queue, current_subqueue = q3, sq3
+            continue
+
+        matches = list(_TIME_BLOCK_RE.finditer(line))
+        # Track section status for lines like "Без світла" / "Зі світлом".  # added
+        inferred_line_status = _status_from_context(None, line)
+        if inferred_line_status in {"OFF", "ON"} and not matches:
+            current_status = inferred_line_status
+            continue
+
+        if not matches:
+            continue
+        if not current_queue or not current_subqueue:
+            continue
+
+        for m in matches:  # added
+            status = (m.group("status") or "").upper()
+            if status not in {"OFF", "ON"}:
+                local_start = max(m.start() - 24, 0)
+                local_end = min(m.end() + 24, len(line))
+                local_ctx = line[local_start:local_end]
+                status = _status_from_context(None, local_ctx)
+            if status not in {"OFF", "ON"} and current_status in {"OFF", "ON"}:  # added
+                status = current_status
+            if status not in {"OFF", "ON"}:
+                continue
+
+            blocks.append(
+                {
+                    "start": _normalize_time(m.group("start")),
+                    "end": _normalize_time(m.group("end")),
+                    "status": status,
+                    "queue": current_queue,
+                    "subqueue": current_subqueue,
+                }
+            )
 
     seen: set[tuple[str, str, str, str, str]] = set()
     unique: list[dict[str, str]] = []
@@ -156,6 +267,9 @@ def fetch_schedule_html(url: str = ALERTS_URL, timeout: int = 25) -> str:
 
 
 def parse_off_schedule(raw_html: str) -> list[dict[str, str]]:
+    text_blocks = _extract_blocks_from_text(raw_html)  # added
+    if text_blocks:
+        return text_blocks
     return _extract_blocks(raw_html)
 
 
