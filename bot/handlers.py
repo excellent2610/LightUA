@@ -5,11 +5,12 @@ import json
 import re
 from typing import Any
 
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
 from bot.formatters import format_off_message, format_on_message  # modified
+from bot.notifications import sync_user_selection
 from core import parser as schedule_parser
 
 router = Router()
@@ -259,7 +260,7 @@ async def cmd_all(message: Message) -> None:
     await message.answer(text)
 
 
-@router.message()
+@router.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message) -> None:
     if not message.text:
         return
@@ -297,6 +298,7 @@ async def on_text(message: Message) -> None:
             city_label = f"Черкаси · {queue}.{subqueue}"  # added
             await message.answer(format_off_message(off_intervals, city=city_label))  # modified
             await message.answer(format_on_message(on_intervals, city=city_label))  # added
+            await sync_user_selection(user_id, queue, subqueue)
             _USER_STATE.pop(user_id, None)
             return
 
