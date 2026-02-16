@@ -335,3 +335,100 @@ def __getattr__(name: str) -> Any:
     if name.lower().endswith("parser"):
         return ScheduleParser
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+#
+# Region-aware compatibility overlay.
+# Keeps legacy parser behavior, but allows selecting oblast URL via region argument.
+#
+from urllib.parse import urlparse
+
+_REGION_SLUGS: dict[str, str] = {
+    "cherkasy": "cherkaska-oblast",
+    "kirovohrad": "kirovogradska-oblast",
+}
+
+
+def _resolve_region_slug(region: str | None) -> str:
+    key = (region or "cherkasy").strip().lower()
+    return _REGION_SLUGS.get(key, _REGION_SLUGS["cherkasy"])
+
+
+def _resolve_region_from_url(url: str | None) -> str:
+    if not url:
+        return "cherkasy"
+    try:
+        path = urlparse(url).path.lower()
+    except Exception:
+        return "cherkasy"
+    for key, slug in _REGION_SLUGS.items():
+        if slug in path:
+            return key
+    return "cherkasy"
+
+
+_LEGACY_BUILD_SCHEDULE_URL = globals().get("build_schedule_url")
+
+
+def build_schedule_url(date_str: str | None = None, region: str | None = None) -> str:  # type: ignore[override]
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    slug = _resolve_region_slug(region)
+    if date_str:
+        return f"https://alerts.org.ua/{slug}/{date_str}/"
+    today = datetime.now(ZoneInfo("Europe/Kyiv")).strftime("%Y-%m-%d")
+    return f"https://alerts.org.ua/{slug}/{today}/"
+
+
+def _with_region_url(region: str | None, url: str | None) -> tuple[str | None, str | None]:
+    region_key = region or _resolve_region_from_url(url)
+    target_url = url or build_schedule_url(region=region_key)
+    old_url = globals().get("SCHEDULE_URL")
+    globals()["SCHEDULE_URL"] = target_url
+    return old_url, target_url
+
+
+def _call_legacy(name: str, *args, **kwargs):
+    fn = globals().get(name)
+    if not callable(fn):
+        raise RuntimeError(f"No parser function: {name}")
+    return fn(*args, **kwargs)
+
+
+_LEGACY_GET_DATA = globals().get("get_data")
+if callable(_LEGACY_GET_DATA):
+    def get_data(*args, region: str | None = None, url: str | None = None, **kwargs):  # type: ignore[override]
+        old_url, _ = _with_region_url(region, url)
+        try:
+            return _LEGACY_GET_DATA(*args, **kwargs)
+        finally:
+            globals()["SCHEDULE_URL"] = old_url
+
+
+_LEGACY_GET_SCHEDULE = globals().get("get_schedule")
+if callable(_LEGACY_GET_SCHEDULE):
+    def get_schedule(*args, region: str | None = None, url: str | None = None, **kwargs):  # type: ignore[override]
+        old_url, _ = _with_region_url(region, url)
+        try:
+            return _LEGACY_GET_SCHEDULE(*args, **kwargs)
+        finally:
+            globals()["SCHEDULE_URL"] = old_url
+
+
+_LEGACY_FETCH_AND_PARSE_SCHEDULE = globals().get("fetch_and_parse_schedule")
+if callable(_LEGACY_FETCH_AND_PARSE_SCHEDULE):
+    def fetch_and_parse_schedule(*args, region: str | None = None, url: str | None = None, **kwargs):  # type: ignore[override]
+        old_url, _ = _with_region_url(region, url)
+        try:
+            return _LEGACY_FETCH_AND_PARSE_SCHEDULE(*args, **kwargs)
+        finally:
+            globals()["SCHEDULE_URL"] = old_url
+
+
+_LEGACY_GET_OFF_SCHEDULE = globals().get("get_off_schedule")
+if callable(_LEGACY_GET_OFF_SCHEDULE):
+    def get_off_schedule(*args, region: str | None = None, url: str | None = None, **kwargs):  # type: ignore[override]
+        old_url, _ = _with_region_url(region, url)
+        try:
+            return _LEGACY_GET_OFF_SCHEDULE(*args, **kwargs)
+        finally:
+            globals()["SCHEDULE_URL"] = old_url

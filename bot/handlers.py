@@ -248,14 +248,32 @@ async def _finalize_selection(message: Message, user_id: int, region: str, queue
     off_intervals, on_intervals = _split_off_on_intervals(intervals)
     queue_label = f"{queue}.{subqueue}" if subqueue else queue
     city_label = f"{get_region_name(region)} · {queue_label}"
-    if off_intervals:
-        await message.answer(format_off_message(off_intervals, city=city_label))
     if on_intervals:
         await message.answer(format_on_message(on_intervals, city=city_label))
+    if off_intervals:
+        await message.answer(format_off_message(off_intervals, city=city_label))
     if not off_intervals and not on_intervals:
         await message.answer("🟢 СЬОГОДНІ ВІДКЛЮЧЕНЬ НЕМАЄ")
     await sync_user_selection(user_id, queue, subqueue, region=region)
     _USER_STATE.pop(user_id, None)
+
+
+@router.message(Command("queue"))
+async def cmd_queue(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else 0
+    user = await store.get_user(user_id)
+    region = (user.region or DEFAULT_REGION_KEY).strip().lower()
+    queue = str(user.queue or "").strip()
+    subqueue = str(user.subqueue or "").strip()
+
+    if not queue:
+        await message.answer("Черга не налаштована. Використайте /start")
+        return
+    if region_supports_subqueues(region) and not subqueue:
+        await message.answer("Підчерга не налаштована. Використайте /start")
+        return
+
+    await _finalize_selection(message, user_id, region, queue, subqueue)
 
 
 @router.message(Command("start"))
@@ -265,7 +283,7 @@ async def cmd_start(message: Message) -> None:
     current_region = (user.region or "").strip().lower()
 
     _USER_STATE[user_id] = {"stage": "await_region"}
-    lines = ["Оберіть область:"]
+    lines = ["Введіть номер області (наприклад: 1):"]
     if current_region:
         lines.insert(0, f"Поточна область: {get_region_name(current_region)}")
     for idx, (_, cfg) in enumerate(list_regions(), start=1):
@@ -278,7 +296,12 @@ async def cmd_region(message: Message) -> None:
     user_id = message.from_user.id if message.from_user else 0
     user = await store.get_user(user_id)
     current = user.region or DEFAULT_REGION_KEY
-    lines = [f"Поточна область: {get_region_name(current)}", "", "Оберіть нову область:"]
+    lines = [
+        f"Поточна область: {get_region_name(current)}",
+        "",
+        "Оберіть нову область:",
+        "Введіть номер області (наприклад: 1):",
+    ]
     for idx, (_, cfg) in enumerate(list_regions(), start=1):
         lines.append(f"{idx}. {cfg['name']}")
     _USER_STATE[user_id] = {"stage": "await_region", "region_change": "1"}

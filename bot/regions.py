@@ -10,7 +10,7 @@ REGIONS: dict[str, dict[str, Any]] = {
         "url": "https://alerts.org.ua/cherkaska-oblast/",
         "queues": [1, 2, 3, 4, 5, 6],
         "subqueues": [1, 2],
-        "swap_on_off": False,
+        "swap_on_off": True,
     },
     "kirovohrad": {
         "name": "Кіровоградська область",
