@@ -28,13 +28,15 @@ async def _run() -> None:
     # Keep only актуальні команди.
     await bot.set_my_commands(
         [
-            BotCommand(command="start", description="обрати чергу і підчергу"),
-            BotCommand(command="all", description="показати весь графік"),
-            BotCommand(command="notify_on", description="увімкнути сповіщення"),
-            BotCommand(command="notify_off", description="вимкнути сповіщення"),
-            BotCommand(command="notify_time", description="час попередження (хв)"),
-            BotCommand(command="status", description="статус сповіщень"),
-            BotCommand(command="notify_test", description="тест сповіщень"),
+            BotCommand(command="start", description="Обрати чергу і підчергу"),
+            BotCommand(command="all", description="Показати весь графік"),
+            BotCommand(command="notify_on", description="Увімкнути сповіщення"),
+            BotCommand(command="notify_off", description="Вимкнути сповіщення"),
+            BotCommand(command="settings", description="Показати налаштування"),
+            BotCommand(command="notify_time", description="Час попередження"),
+            BotCommand(command="notify_types", description="Типи сповіщень"),
+            BotCommand(command="quiet_hours", description="Тиха година"),
+            BotCommand(command="notify_test", description="Тест сповіщень"),
         ]
     )
 

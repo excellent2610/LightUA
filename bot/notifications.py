@@ -17,8 +17,11 @@ from aiogram import Bot, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
+from bot.user_settings import can_send_notification, is_quiet_time
+
 TZ = ZoneInfo("Europe/Kyiv")
 DEFAULT_NOTIFY_BEFORE_MINUTES = 5
+ALLOWED_NOTIFY_MINUTES = (5, 10, 15, 30)
 log = logging.getLogger(__name__)
 
 notifications_router = Router(name="notifications")
@@ -69,6 +72,11 @@ class UserSettings:
     subqueue: str | None
     notifications_enabled: bool
     notify_before_minutes: int
+    notify_off_enabled: bool
+    notify_on_enabled: bool
+    quiet_hours_enabled: bool
+    quiet_from: str | None
+    quiet_to: str | None
 
 
 @dataclass(slots=True)
@@ -109,10 +117,16 @@ class NotificationStore:
                   subqueue TEXT,
                   notifications_enabled INTEGER NOT NULL DEFAULT 1,
                   notify_before_minutes INTEGER NOT NULL DEFAULT 5,
+                  notify_off_enabled INTEGER NOT NULL DEFAULT 1,
+                  notify_on_enabled INTEGER NOT NULL DEFAULT 1,
+                  quiet_hours_enabled INTEGER NOT NULL DEFAULT 0,
+                  quiet_from TEXT,
+                  quiet_to TEXT,
                   updated_at TEXT NOT NULL
                 )
                 """
             )
+            self._ensure_user_settings_columns(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sent_notifications(
@@ -124,6 +138,21 @@ class NotificationStore:
                 """
             )
             conn.commit()
+
+    def _ensure_user_settings_columns(self, conn: sqlite3.Connection) -> None:
+        # Lightweight online migration for existing databases.
+        rows = conn.execute("PRAGMA table_info(user_settings)").fetchall()
+        existing = {str(row[1]) for row in rows}
+        migrations: list[tuple[str, str]] = [
+            ("notify_off_enabled", "ALTER TABLE user_settings ADD COLUMN notify_off_enabled INTEGER NOT NULL DEFAULT 1"),
+            ("notify_on_enabled", "ALTER TABLE user_settings ADD COLUMN notify_on_enabled INTEGER NOT NULL DEFAULT 1"),
+            ("quiet_hours_enabled", "ALTER TABLE user_settings ADD COLUMN quiet_hours_enabled INTEGER NOT NULL DEFAULT 0"),
+            ("quiet_from", "ALTER TABLE user_settings ADD COLUMN quiet_from TEXT"),
+            ("quiet_to", "ALTER TABLE user_settings ADD COLUMN quiet_to TEXT"),
+        ]
+        for col, ddl in migrations:
+            if col not in existing:
+                conn.execute(ddl)
 
     async def ensure_user(self, user_id: int) -> None:
         await self.init()
@@ -150,6 +179,11 @@ class NotificationStore:
         subqueue: str | None = None,
         notifications_enabled: bool | None = None,
         notify_before_minutes: int | None = None,
+        notify_off_enabled: bool | None = None,
+        notify_on_enabled: bool | None = None,
+        quiet_hours_enabled: bool | None = None,
+        quiet_from: str | None = None,
+        quiet_to: str | None = None,
     ) -> None:
         await self.ensure_user(user_id)
         await asyncio.to_thread(
@@ -159,6 +193,11 @@ class NotificationStore:
             subqueue,
             notifications_enabled,
             notify_before_minutes,
+            notify_off_enabled,
+            notify_on_enabled,
+            quiet_hours_enabled,
+            quiet_from,
+            quiet_to,
         )
 
     def _update_settings_sync(
@@ -168,6 +207,11 @@ class NotificationStore:
         subqueue: str | None,
         notifications_enabled: bool | None,
         notify_before_minutes: int | None,
+        notify_off_enabled: bool | None,
+        notify_on_enabled: bool | None,
+        quiet_hours_enabled: bool | None,
+        quiet_from: str | None,
+        quiet_to: str | None,
     ) -> None:
         now = datetime.now(TZ).isoformat()
         with self._connect() as conn:
@@ -191,6 +235,31 @@ class NotificationStore:
                     "UPDATE user_settings SET notify_before_minutes=?, updated_at=? WHERE user_id=?",
                     (notify_before_minutes, now, user_id),
                 )
+            if notify_off_enabled is not None:
+                conn.execute(
+                    "UPDATE user_settings SET notify_off_enabled=?, updated_at=? WHERE user_id=?",
+                    (1 if notify_off_enabled else 0, now, user_id),
+                )
+            if notify_on_enabled is not None:
+                conn.execute(
+                    "UPDATE user_settings SET notify_on_enabled=?, updated_at=? WHERE user_id=?",
+                    (1 if notify_on_enabled else 0, now, user_id),
+                )
+            if quiet_hours_enabled is not None:
+                conn.execute(
+                    "UPDATE user_settings SET quiet_hours_enabled=?, updated_at=? WHERE user_id=?",
+                    (1 if quiet_hours_enabled else 0, now, user_id),
+                )
+            if quiet_from is not None:
+                conn.execute(
+                    "UPDATE user_settings SET quiet_from=?, updated_at=? WHERE user_id=?",
+                    (quiet_from, now, user_id),
+                )
+            if quiet_to is not None:
+                conn.execute(
+                    "UPDATE user_settings SET quiet_to=?, updated_at=? WHERE user_id=?",
+                    (quiet_to, now, user_id),
+                )
             conn.commit()
 
     async def get_user(self, user_id: int) -> UserSettings:
@@ -203,6 +272,11 @@ class NotificationStore:
             subqueue=row["subqueue"],
             notifications_enabled=bool(row["notifications_enabled"]),
             notify_before_minutes=int(row["notify_before_minutes"]),
+            notify_off_enabled=bool(row["notify_off_enabled"]),
+            notify_on_enabled=bool(row["notify_on_enabled"]),
+            quiet_hours_enabled=bool(row["quiet_hours_enabled"]),
+            quiet_from=row["quiet_from"],
+            quiet_to=row["quiet_to"],
         )
 
     def _get_user_sync(self, user_id: int) -> sqlite3.Row | None:
@@ -222,6 +296,11 @@ class NotificationStore:
                 subqueue=r["subqueue"],
                 notifications_enabled=bool(r["notifications_enabled"]),
                 notify_before_minutes=int(r["notify_before_minutes"]),
+                notify_off_enabled=bool(r["notify_off_enabled"]),
+                notify_on_enabled=bool(r["notify_on_enabled"]),
+                quiet_hours_enabled=bool(r["quiet_hours_enabled"]),
+                quiet_from=r["quiet_from"],
+                quiet_to=r["quiet_to"],
             )
             for r in rows
         ]
@@ -428,15 +507,14 @@ async def check_and_notify_users(bot: Bot) -> None:
         for ev in events:
             # current day
             notify_at = ev.event_time - before_delta
-            sec = (now - notify_at).total_seconds()
-            if 0 <= sec < 60:
+            # Keep event eligible after planned notify time until start time.
+            # This allows delivery after quiet hours end without marking it lost.
+            if notify_at <= now < ev.event_time:
                 due_candidates.append((ev.event_time, ev))
-                continue
             # next day
             ev_next = ev.event_time + timedelta(days=1)
             notify_at_next = ev_next - before_delta
-            sec2 = (now - notify_at_next).total_seconds()
-            if 0 <= sec2 < 60:
+            if notify_at_next <= now < ev_next:
                 clone = Event(ev_next, ev.event_type, ev.interval, ev.start, ev.end)
                 due_candidates.append((ev_next, clone))
 
@@ -448,6 +526,8 @@ async def check_and_notify_users(bot: Bot) -> None:
                 selected[start_dt] = ev
 
         for start_dt, ev in selected.items():
+            if not can_send_notification(ev, user):
+                continue
             key = _event_key(user.user_id, ev.event_type, start_dt, ev.start, ev.end, user.notify_before_minutes)
             if await store.was_sent(user.user_id, key):
                 continue
@@ -518,6 +598,61 @@ def _parse_queue_subqueue(raw: str) -> tuple[str, str] | None:
     return m.group(1), m.group(2)
 
 
+def _parse_hhmm(value: str) -> str | None:
+    try:
+        hh, mm = value.split(":", 1)
+        h = int(hh)
+        m = int(mm)
+    except Exception:
+        return None
+    if 0 <= h <= 23 and 0 <= m <= 59:
+        return f"{h:02d}:{m:02d}"
+    return None
+
+
+def _parse_quiet_hours_arg(raw: str) -> tuple[str, str] | None:
+    text = raw.strip().replace("–", "-")
+    if "-" in text:
+        left, right = text.split("-", 1)
+    else:
+        parts = text.split()
+        if len(parts) != 2:
+            return None
+        left, right = parts[0], parts[1]
+    start = _parse_hhmm(left.strip())
+    end = _parse_hhmm(right.strip())
+    if start is None or end is None:
+        return None
+    return start, end
+
+
+def _enabled_label(value: bool) -> str:
+    return "увімкнено" if value else "вимкнено"
+
+
+def _quiet_label(settings: UserSettings) -> str:
+    if not settings.quiet_hours_enabled:
+        return "вимкнено"
+    if settings.quiet_from and settings.quiet_to:
+        return f"{settings.quiet_from} – {settings.quiet_to}"
+    return "увімкнено"
+
+
+def _settings_text(settings: UserSettings) -> str:
+    status = _enabled_label(settings.notifications_enabled)
+    off_label = _enabled_label(settings.notify_off_enabled)
+    on_label = _enabled_label(settings.notify_on_enabled)
+    quiet = _quiet_label(settings)
+    return (
+        "⚙️ Налаштування сповіщень\n\n"
+        f"🔔 Статус: {status}\n"
+        f"⏱ Попередження: за {settings.notify_before_minutes} хв\n"
+        f"🔴 Відключення: {off_label}\n"
+        f"🟢 Ввімкнення: {on_label}\n"
+        f"🌙 Тиха година: {quiet}"
+    )
+
+
 @notifications_router.message(Command("notify_on"))
 async def notify_on_handler(message: Message) -> None:
     if message.from_user is None:
@@ -560,40 +695,149 @@ async def notify_off_handler(message: Message) -> None:
 async def notify_time_handler(message: Message) -> None:
     if message.from_user is None:
         return
+    user_id = message.from_user.id
     parts = (message.text or "").strip().split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer("Використання: `/notify_time 5`", parse_mode="Markdown")
+        await message.answer(
+            "Оберіть час попередження: 5, 10, 15 або 30 хв.\n"
+            "Приклад: `/notify_time 10`",
+            parse_mode="Markdown",
+        )
         return
     try:
         minutes = int(parts[1].strip())
     except ValueError:
-        await message.answer("Вкажіть число хвилин, наприклад: `/notify_time 10`", parse_mode="Markdown")
+        await message.answer("Вкажіть одне з значень: 5, 10, 15, 30.")
         return
-    if minutes < 1 or minutes > 120:
-        await message.answer("Допустимий діапазон: від 1 до 120 хвилин.")
+    if minutes not in ALLOWED_NOTIFY_MINUTES:
+        await message.answer("Доступні значення: 5, 10, 15, 30 хв.")
         return
-    await store.update_settings(message.from_user.id, notify_before_minutes=minutes)
+    await store.update_settings(user_id, notify_before_minutes=minutes)
     await message.answer(f"⏱ Час попередження змінено: {minutes} хв.")
 
 
+@notifications_router.message(Command("notify_types"))
+async def notify_types_handler(message: Message) -> None:
+    if message.from_user is None:
+        return
+    user_id = message.from_user.id
+    await store.ensure_user(user_id)
+    parts = (message.text or "").strip().split(maxsplit=1)
+    if len(parts) < 2:
+        settings = await store.get_user(user_id)
+        off_mark = "✔️" if settings.notify_off_enabled else "✖️"
+        on_mark = "✔️" if settings.notify_on_enabled else "✖️"
+        await message.answer(
+            "Типи сповіщень:\n"
+            f"[{off_mark}] Відключення\n"
+            f"[{on_mark}] Ввімкнення\n\n"
+            "Керування: `/notify_types 3`\n"
+            "0 = вимкнути обидва, 1 = лише відключення,\n"
+            "2 = лише ввімкнення, 3 = обидва",
+            parse_mode="Markdown",
+        )
+        return
+
+    arg = parts[1].strip().lower()
+    mapping: dict[str, tuple[bool, bool]] = {
+        "0": (False, False),
+        "none": (False, False),
+        "1": (True, False),
+        "off": (True, False),
+        "2": (False, True),
+        "on": (False, True),
+        "3": (True, True),
+        "both": (True, True),
+        "all": (True, True),
+    }
+    if arg not in mapping:
+        await message.answer("Невірне значення. Використайте `/notify_types 0|1|2|3`.", parse_mode="Markdown")
+        return
+
+    off_enabled, on_enabled = mapping[arg]
+    await store.update_settings(
+        user_id,
+        notify_off_enabled=off_enabled,
+        notify_on_enabled=on_enabled,
+    )
+    await message.answer(
+        "Оновлено типи сповіщень:\n"
+        f"🔴 Відключення: {_enabled_label(off_enabled)}\n"
+        f"🟢 Ввімкнення: {_enabled_label(on_enabled)}"
+    )
+
+
+@notifications_router.message(Command("quiet_hours"))
+async def quiet_hours_handler(message: Message) -> None:
+    if message.from_user is None:
+        return
+    user_id = message.from_user.id
+    await store.ensure_user(user_id)
+    parts = (message.text or "").strip().split(maxsplit=1)
+    if len(parts) < 2:
+        settings = await store.get_user(user_id)
+        await message.answer(
+            "Тиха година:\n"
+            f"Поточний стан: {_quiet_label(settings)}\n\n"
+            "Команди:\n"
+            "`/quiet_hours off` - вимкнути\n"
+            "`/quiet_hours on` - увімкнути з поточним інтервалом\n"
+            "`/quiet_hours 23:00-07:00` - задати інтервал",
+            parse_mode="Markdown",
+        )
+        return
+
+    arg = parts[1].strip()
+    lowered = arg.lower()
+    if lowered in {"off", "disable", "0"}:
+        await store.update_settings(user_id, quiet_hours_enabled=False)
+        await message.answer("🌙 Тиху годину вимкнено.")
+        return
+
+    if lowered in {"on", "enable", "1"}:
+        settings = await store.get_user(user_id)
+        if not settings.quiet_from or not settings.quiet_to:
+            await message.answer("Спочатку задайте інтервал: `/quiet_hours 23:00-07:00`", parse_mode="Markdown")
+            return
+        await store.update_settings(user_id, quiet_hours_enabled=True)
+        await message.answer(f"🌙 Тиху годину увімкнено: {settings.quiet_from} – {settings.quiet_to}")
+        return
+
+    parsed = _parse_quiet_hours_arg(arg)
+    if parsed is None:
+        await message.answer("Невірний формат. Приклад: `/quiet_hours 23:00-07:00`", parse_mode="Markdown")
+        return
+    quiet_from, quiet_to = parsed
+    await store.update_settings(
+        user_id,
+        quiet_hours_enabled=True,
+        quiet_from=quiet_from,
+        quiet_to=quiet_to,
+    )
+    await message.answer(f"🌙 Тиху годину увімкнено: {quiet_from} – {quiet_to}")
+
+
+@notifications_router.message(Command("settings"))
 @notifications_router.message(Command("status"))
 async def status_handler(message: Message) -> None:
     if message.from_user is None:
         return
     settings = await store.get_user(message.from_user.id)
     queue_label = f"{settings.queue}.{settings.subqueue}" if settings.queue and settings.subqueue else "не обрано"
-    enabled_label = "увімкнено" if settings.notifications_enabled else "вимкнено"
 
     next_block = ""
-    if settings.notifications_enabled and settings.queue and settings.subqueue:
+    if (
+        settings.notifications_enabled
+        and settings.queue
+        and settings.subqueue
+        and not is_quiet_time(datetime.now(TZ), settings)
+    ):
         next_preview = _preview_next_event(settings.queue, settings.subqueue, settings.notify_before_minutes)
         next_block = f"\n{next_preview}" if next_preview else "\nНайближчих подій на сьогодні не знайдено."
 
     await message.answer(
-        "📋 Поточні налаштування:\n"
-        f"Сповіщення: {enabled_label}\n"
-        f"Час попередження: {settings.notify_before_minutes} хв\n"
-        f"Черга: {queue_label}"
+        f"{_settings_text(settings)}\n"
+        f"📍 Черга: {queue_label}"
         f"{next_block}"
     )
 
