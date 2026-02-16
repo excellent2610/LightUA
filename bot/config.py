@@ -4,10 +4,18 @@ import ast
 import os
 import re
 import runpy
+import sys
 from pathlib import Path
 from typing import Dict
 
-from core.parser import build_schedule_url
+try:
+    from core.parser import build_schedule_url
+except ModuleNotFoundError:
+    # Support direct execution of this file (python bot/config.py).
+    project_root = Path(__file__).resolve().parents[1]
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    from core.parser import build_schedule_url
 
 _TOKEN_KEYS = (
     "BOT_TOKEN",
@@ -169,6 +177,18 @@ BOT_TOKEN = (
     or _load_from_config_py_text()
     or _load_from_config_py_runtime()
 )
+
+# Region schedule pages (explicit mapping requested by product logic).
+CHERKASY_SCHEDULE_URL = os.getenv("CHERKASY_SCHEDULE_URL", "https://alerts.org.ua/cherkaska-oblast/").strip()
+KIROVOHRAD_SCHEDULE_URL = os.getenv("KIROVOHRAD_SCHEDULE_URL", "https://alerts.org.ua/kirovogradska-oblast/").strip()
+
+
+def get_schedule_url_for_region(region: str | None) -> str:
+    key = (region or "cherkasy").strip().lower()
+    if key == "kirovohrad":
+        return KIROVOHRAD_SCHEDULE_URL
+    return CHERKASY_SCHEDULE_URL
+
 
 # Priority: explicit URL > explicit date > today's date (Europe/Kyiv)
 _explicit_url = os.getenv("SCHEDULE_URL", "").strip()

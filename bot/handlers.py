@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from typing import Any
 
@@ -10,8 +11,16 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from bot.formatters import format_off_message, format_on_message  # modified
-from bot.notifications import sync_user_selection
+from bot.notifications import store, sync_user_selection
+from bot.regions import (
+    DEFAULT_REGION_KEY,
+    get_region_config,
+    get_region_name,
+    list_regions,
+    region_supports_subqueues,
+)
 from core import parser as schedule_parser
+from core.region_schedule import load_region_schedule
 
 router = Router()
 
@@ -61,6 +70,15 @@ def _dedupe_intervals(intervals: list[dict[str, str]]) -> list[dict[str, str]]: 
 
 
 def _extract_for_queue_subqueue(data: Any, queue: str, subqueue: str) -> list[dict[str, str]]:
+    if not subqueue:
+        by_queue = [
+            x
+            for x in (data if isinstance(data, list) else [])
+            if isinstance(x, dict) and str(x.get("queue", "")).strip() == queue
+        ]
+        if by_queue:
+            return _dedupe_intervals(_collect_intervals(by_queue))
+
     if isinstance(data, list):
         tagged = [
             x
@@ -139,7 +157,7 @@ def _split_off_on_intervals(intervals: list[dict[str, str]]) -> tuple[list[dict[
         elif status == "ON":
             on_intervals.append({"start": str(it.get("start", "")), "end": str(it.get("end", "")), "status": "ON"})
 
-    # If parser returned only OFF, build ON as complement for 00:00-24:00.  # added
+    # If both sets are present, trust explicit statuses as-is.
     if on_intervals:
         return _dedupe_intervals(off_intervals), _dedupe_intervals(on_intervals)
 
@@ -175,27 +193,107 @@ def _split_off_on_intervals(intervals: list[dict[str, str]]) -> tuple[list[dict[
 
 
 async def _load_schedule_data() -> Any:
+    return await _load_schedule_data_for_region(DEFAULT_REGION_KEY)
+
+
+async def _load_schedule_data_for_region(region: str | None) -> Any:
+    region_key = (region or DEFAULT_REGION_KEY).strip().lower()
+    from bot.config import get_schedule_url_for_region
+
+    region_url = get_schedule_url_for_region(region_key)
+
     def _sync() -> Any:
-        for fn_name in ("get_data", "get_schedule", "fetch_and_parse_schedule", "get_off_schedule"):
+        try:
+            direct = load_region_schedule(region_key)
+            if isinstance(direct, list) and direct:
+                return direct
+        except Exception:
+            pass
+
+        # Force the exact selected oblast page URL.
+        os.environ["SCHEDULE_URL"] = region_url
+        for fn_name in ("get_off_schedule", "get_data", "get_schedule", "fetch_and_parse_schedule"):
             fn = getattr(schedule_parser, fn_name, None)
             if callable(fn):
+                try:
+                    return fn(url=region_url, timeout=35)
+                except TypeError:
+                    pass
+                try:
+                    return fn(url=region_url)
+                except TypeError:
+                    pass
+                try:
+                    return fn(region=region_key, url=region_url)
+                except TypeError:
+                    pass
+                try:
+                    return fn(region=region_key)
+                except TypeError:
+                    pass
+                try:
+                    return fn(region_url)
+                except TypeError:
+                    pass
                 return fn()
         raise RuntimeError("No schedule loader found")
 
     return await asyncio.to_thread(_sync)
 
 
+async def _finalize_selection(message: Message, user_id: int, region: str, queue: str, subqueue: str) -> None:
+    await message.answer("Отримую графік, зачекайте...")
+    data = await asyncio.wait_for(_load_schedule_data_for_region(region), timeout=35)
+    intervals = _extract_for_queue_subqueue(data, queue, subqueue)
+    off_intervals, on_intervals = _split_off_on_intervals(intervals)
+    queue_label = f"{queue}.{subqueue}" if subqueue else queue
+    city_label = f"{get_region_name(region)} · {queue_label}"
+    if off_intervals:
+        await message.answer(format_off_message(off_intervals, city=city_label))
+    if on_intervals:
+        await message.answer(format_on_message(on_intervals, city=city_label))
+    if not off_intervals and not on_intervals:
+        await message.answer("🟢 СЬОГОДНІ ВІДКЛЮЧЕНЬ НЕМАЄ")
+    await sync_user_selection(user_id, queue, subqueue, region=region)
+    _USER_STATE.pop(user_id, None)
+
+
 @router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
     user_id = message.from_user.id if message.from_user else 0
-    _USER_STATE[user_id] = {"stage": "await_queue"}
-    await message.answer("Бот активний.\nВведіть номер черги (наприклад: 1):")
+    user = await store.get_user(user_id)
+    current_region = (user.region or "").strip().lower()
+
+    _USER_STATE[user_id] = {"stage": "await_region"}
+    lines = ["Оберіть область:"]
+    if current_region:
+        lines.insert(0, f"Поточна область: {get_region_name(current_region)}")
+    for idx, (_, cfg) in enumerate(list_regions(), start=1):
+        lines.append(f"{idx}. {cfg['name']}")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("region"))
+async def cmd_region(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else 0
+    user = await store.get_user(user_id)
+    current = user.region or DEFAULT_REGION_KEY
+    lines = [f"Поточна область: {get_region_name(current)}", "", "Оберіть нову область:"]
+    for idx, (_, cfg) in enumerate(list_regions(), start=1):
+        lines.append(f"{idx}. {cfg['name']}")
+    _USER_STATE[user_id] = {"stage": "await_region", "region_change": "1"}
+    await message.answer("\n".join(lines))
 
 
 @router.message(Command("all"))
 async def cmd_all(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else 0
+    user = await store.get_user(user_id)
+    region = user.region or DEFAULT_REGION_KEY
+    region_name = get_region_name(region)
+
     try:
-        data = await asyncio.wait_for(_load_schedule_data(), timeout=35)
+        data = await asyncio.wait_for(_load_schedule_data_for_region(region), timeout=35)
     except Exception:
         await message.answer("Не вдалося отримати графік із alerts.org.ua")
         return
@@ -241,7 +339,7 @@ async def cmd_all(message: Message) -> None:
             lines.append(f"{start} – {end}")
         return lines
 
-    sections: list[str] = ["🔴 ПОВНИЙ ГРАФІК ВІДКЛЮЧЕНЬ (Черкаси)"]
+    sections: list[str] = [f"🔴 ПОВНИЙ ГРАФІК ВІДКЛЮЧЕНЬ ({region_name})"]
     for key in sorted(groups.keys(), key=lambda x: tuple(map(int, x.split(".")))):
         lines = render_lines(groups[key])
         if not lines:
@@ -275,31 +373,66 @@ async def on_text(message: Message) -> None:
 
     try:
         if stage == "await_queue":
+            region = state.get("region") or DEFAULT_REGION_KEY
             if not _NUM_RE.fullmatch(text):
                 await message.answer("Невірний формат черги. Введіть число, наприклад: 4")
                 return
             state["queue"] = text
-            state["stage"] = "await_subqueue"
-            await message.answer(f"Черга {text} збережена.\nВведіть номер підчерги (наприклад: 1):")
+            if region_supports_subqueues(region):
+                state["stage"] = "await_subqueue"
+                await message.answer(f"Черга {text} збережена.\nВведіть номер підчерги (наприклад: 1):")
+            else:
+                await _finalize_selection(message, user_id, region, text, "")
+            return
+
+        if stage == "await_region":
+            regions = list_regions()
+            selected_key: str | None = None
+            if _NUM_RE.fullmatch(text):
+                idx = int(text)
+                if 1 <= idx <= len(regions):
+                    selected_key = regions[idx - 1][0]
+            else:
+                normalized = text.strip().lower()
+                if normalized in dict(regions):
+                    selected_key = normalized
+            if not selected_key:
+                await message.answer("Невірний вибір області. Введіть номер зі списку.")
+                return
+
+            current_user = await store.get_user(user_id)
+            previous_region = (current_user.region or "").strip().lower()
+            await store.update_settings(user_id, region=selected_key)
+            if previous_region and previous_region != selected_key:
+                await store.update_settings(user_id, queue="", subqueue="")
+            state["region"] = selected_key
+            state["stage"] = "await_queue"
+            await message.answer(
+                f"Область збережено: {get_region_name(selected_key)}\n"
+                "Введіть номер черги (наприклад: 1):"
+            )
             return
 
         if stage == "await_subqueue":
-            if not _NUM_RE.fullmatch(text):
-                await message.answer("Невірний формат підчерги. Введіть число, наприклад: 1")
-                return
+            region = state.get("region") or DEFAULT_REGION_KEY
+            cfg = get_region_config(region)
+            requires_subqueue = region_supports_subqueues(region)
+            if requires_subqueue:
+                if not _NUM_RE.fullmatch(text):
+                    await message.answer("Невірний формат підчерги. Введіть число, наприклад: 1")
+                    return
+                subqueue_num = int(text)
+                allowed_subqueues = cfg.get("subqueues") or []
+                if allowed_subqueues and subqueue_num not in allowed_subqueues:
+                    allowed = ", ".join(str(x) for x in allowed_subqueues)
+                    await message.answer(f"Для цієї області доступні підчерги: {allowed}")
+                    return
+                subqueue = text
+            else:
+                subqueue = ""
 
             queue = state.get("queue", "")
-            subqueue = text
-            await message.answer("Отримую графік, зачекайте...")
-
-            data = await asyncio.wait_for(_load_schedule_data(), timeout=35)
-            intervals = _extract_for_queue_subqueue(data, queue, subqueue)
-            off_intervals, on_intervals = _split_off_on_intervals(intervals)  # added
-            city_label = f"Черкаси · {queue}.{subqueue}"  # added
-            await message.answer(format_off_message(off_intervals, city=city_label))  # modified
-            await message.answer(format_on_message(on_intervals, city=city_label))  # added
-            await sync_user_selection(user_id, queue, subqueue)
-            _USER_STATE.pop(user_id, None)
+            await _finalize_selection(message, user_id, region, queue, subqueue)
             return
 
         # Unknown stale stage -> reset safely.

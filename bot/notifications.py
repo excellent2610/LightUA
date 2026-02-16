@@ -17,7 +17,10 @@ from aiogram import Bot, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
+from bot.config import get_schedule_url_for_region
+from bot.regions import DEFAULT_REGION_KEY, get_region_name
 from bot.user_settings import can_send_notification, is_quiet_time
+from core.region_schedule import load_region_schedule
 
 TZ = ZoneInfo("Europe/Kyiv")
 DEFAULT_NOTIFY_BEFORE_MINUTES = 5
@@ -68,6 +71,7 @@ DB_PATH = _pick_writable_db_path()
 @dataclass(slots=True)
 class UserSettings:
     user_id: int
+    region: str | None
     queue: str | None
     subqueue: str | None
     notifications_enabled: bool
@@ -113,6 +117,7 @@ class NotificationStore:
                 """
                 CREATE TABLE IF NOT EXISTS user_settings(
                   user_id INTEGER PRIMARY KEY,
+                  region TEXT,
                   queue TEXT,
                   subqueue TEXT,
                   notifications_enabled INTEGER NOT NULL DEFAULT 1,
@@ -144,6 +149,7 @@ class NotificationStore:
         rows = conn.execute("PRAGMA table_info(user_settings)").fetchall()
         existing = {str(row[1]) for row in rows}
         migrations: list[tuple[str, str]] = [
+            ("region", "ALTER TABLE user_settings ADD COLUMN region TEXT"),
             ("notify_off_enabled", "ALTER TABLE user_settings ADD COLUMN notify_off_enabled INTEGER NOT NULL DEFAULT 1"),
             ("notify_on_enabled", "ALTER TABLE user_settings ADD COLUMN notify_on_enabled INTEGER NOT NULL DEFAULT 1"),
             ("quiet_hours_enabled", "ALTER TABLE user_settings ADD COLUMN quiet_hours_enabled INTEGER NOT NULL DEFAULT 0"),
@@ -175,6 +181,7 @@ class NotificationStore:
         self,
         user_id: int,
         *,
+        region: str | None = None,
         queue: str | None = None,
         subqueue: str | None = None,
         notifications_enabled: bool | None = None,
@@ -189,6 +196,7 @@ class NotificationStore:
         await asyncio.to_thread(
             self._update_settings_sync,
             user_id,
+            region,
             queue,
             subqueue,
             notifications_enabled,
@@ -203,6 +211,7 @@ class NotificationStore:
     def _update_settings_sync(
         self,
         user_id: int,
+        region: str | None,
         queue: str | None,
         subqueue: str | None,
         notifications_enabled: bool | None,
@@ -219,6 +228,11 @@ class NotificationStore:
                 conn.execute(
                     "UPDATE user_settings SET queue=?, updated_at=? WHERE user_id=?",
                     (queue, now, user_id),
+                )
+            if region is not None:
+                conn.execute(
+                    "UPDATE user_settings SET region=?, updated_at=? WHERE user_id=?",
+                    (region, now, user_id),
                 )
             if subqueue is not None:
                 conn.execute(
@@ -268,6 +282,7 @@ class NotificationStore:
         assert row is not None
         return UserSettings(
             user_id=row["user_id"],
+            region=row["region"],
             queue=row["queue"],
             subqueue=row["subqueue"],
             notifications_enabled=bool(row["notifications_enabled"]),
@@ -292,6 +307,7 @@ class NotificationStore:
         return [
             UserSettings(
                 user_id=r["user_id"],
+                region=r["region"],
                 queue=r["queue"],
                 subqueue=r["subqueue"],
                 notifications_enabled=bool(r["notifications_enabled"]),
@@ -350,12 +366,41 @@ def _schedule_module() -> Any:
     raise RuntimeError("Schedule parser module not found.")
 
 
-def _load_schedule() -> list[dict[str, str]]:
+def _load_schedule(region: str | None = None) -> list[dict[str, str]]:
     parser_mod = _schedule_module()
-    for fn_name in ("get_data", "get_schedule", "fetch_and_parse_schedule", "get_off_schedule", "get_blackout_periods"):
+    region_key = (region or DEFAULT_REGION_KEY).strip().lower()
+    region_url = get_schedule_url_for_region(region_key)
+    try:
+        direct = load_region_schedule(region_key)
+        if isinstance(direct, list) and direct:
+            return direct
+    except Exception:
+        pass
+
+    os.environ["SCHEDULE_URL"] = region_url
+
+    for fn_name in ("get_off_schedule", "get_data", "get_schedule", "fetch_and_parse_schedule", "get_blackout_periods"):
         fn = getattr(parser_mod, fn_name, None)
         if callable(fn):
-            data = fn()
+            try:
+                data = fn(url=region_url, timeout=35)
+            except TypeError:
+                try:
+                    data = fn(url=region_url)
+                except TypeError:
+                    try:
+                        data = fn(region=region_key, url=region_url)
+                    except TypeError:
+                        try:
+                            data = fn(region=region_key)
+                        except TypeError:
+                            try:
+                                data = fn(region_url)
+                            except TypeError:
+                                try:
+                                    data = fn(region_key)
+                                except TypeError:
+                                    data = fn()
             if isinstance(data, list):
                 return data
     raise RuntimeError("No compatible schedule getter.")
@@ -370,8 +415,23 @@ def _parse_hh_mm(value: str, ref: datetime) -> datetime:
     return ref.replace(hour=h, minute=m, second=0, microsecond=0)
 
 
-def _get_intervals(queue: str, subqueue: str) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    raw = _load_schedule()
+def _get_intervals(
+    region_or_queue: str | None,
+    queue_or_subqueue: str,
+    subqueue: str | None = None,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    # Backward-compatible call forms:
+    # _get_intervals(queue, subqueue)
+    # _get_intervals(region, queue, subqueue)
+    if subqueue is None:
+        region = None
+        queue = str(region_or_queue or "")
+        subqueue = queue_or_subqueue
+    else:
+        region = region_or_queue
+        queue = queue_or_subqueue
+
+    raw = _load_schedule(region)
     from bot import handlers as handlers_mod
 
     intervals = handlers_mod._extract_for_queue_subqueue(raw, queue, subqueue)
@@ -447,10 +507,28 @@ def get_next_event(now: datetime, schedule: list[Event], notify_before_minutes: 
     return candidates[0]
 
 
-def _preview_next_event(queue: str, subqueue: str, notify_before_minutes: int) -> str | None:
+def _preview_next_event(
+    region_or_queue: str | None,
+    queue_or_subqueue: str,
+    subqueue_or_minutes: str | int,
+    notify_before_minutes: int | None = None,
+) -> str | None:
+    # Backward-compatible call forms:
+    # _preview_next_event(queue, subqueue, minutes)
+    # _preview_next_event(region, queue, subqueue, minutes)
+    if notify_before_minutes is None:
+        region = None
+        queue = str(region_or_queue or "")
+        subqueue = str(queue_or_subqueue)
+        notify_before_minutes = int(subqueue_or_minutes)
+    else:
+        region = region_or_queue
+        queue = str(queue_or_subqueue)
+        subqueue = str(subqueue_or_minutes)
+
     now = datetime.now(TZ)
     try:
-        off_intervals, on_intervals = _get_intervals(queue, subqueue)
+        off_intervals, on_intervals = _get_intervals(region, queue, subqueue)
         schedule = _build_events(now, off_intervals, on_intervals)
         nxt = get_next_event(now, schedule, notify_before_minutes)
     except Exception:
@@ -471,20 +549,32 @@ def _event_key(user_id: int, event_type: str, event_start_dt: datetime, start: s
     return f"{user_id}|{day}|{event_type}|{start}|{end}|{before}"
 
 
-async def send_notification(bot: Bot, user_id: int, ev_type: str, start: str, end: str, queue: str, subqueue: str, before: int) -> None:
+async def send_notification(
+    bot: Bot,
+    user_id: int,
+    ev_type: str,
+    start: str,
+    end: str,
+    queue: str,
+    subqueue: str,
+    before: int,
+    region: str | None = None,
+) -> None:
+    region_name = get_region_name(region or DEFAULT_REGION_KEY)
+    queue_label = f"{queue}.{subqueue}" if subqueue else queue
     if ev_type == "off":
         text = (
             "⚠️ Увага!\n"
             f"Через {before} хвилин буде ВІДКЛЮЧЕННЯ світла ⚡\n\n"
             f"🕒 {start} – {end}\n"
-            f"Черкаси · Черга {queue}.{subqueue}"
+            f"{region_name} · Черга {queue_label}"
         )
     else:
         text = (
             "✅ Гарні новини!\n"
             f"Через {before} хвилин СВІТЛО З'ЯВИТЬСЯ 💡\n\n"
             f"🕒 {start} – {end}\n"
-            f"Черкаси · Черга {queue}.{subqueue}"
+            f"{region_name} · Черга {queue_label}"
         )
     await bot.send_message(user_id, text)
 
@@ -493,10 +583,10 @@ async def check_and_notify_users(bot: Bot) -> None:
     now = datetime.now(TZ)
     users = await store.get_enabled_users()
     for user in users:
-        if not user.queue or not user.subqueue:
+        if not user.queue:
             continue
         try:
-            off_intervals, on_intervals = _get_intervals(user.queue, user.subqueue)
+            off_intervals, on_intervals = _get_intervals(user.region, user.queue, user.subqueue)
             events = _build_events(now, off_intervals, on_intervals)
         except Exception:
             log.exception("Failed to build events for user=%s", user.user_id)
@@ -541,6 +631,7 @@ async def check_and_notify_users(bot: Bot) -> None:
                     user.queue,
                     user.subqueue,
                     user.notify_before_minutes,
+                    user.region,
                 )
                 await store.mark_sent(user.user_id, key)
             except Exception:
@@ -585,14 +676,14 @@ class NotificationService:
 notification_service = NotificationService()
 
 
-async def sync_user_selection(user_id: int, queue: str, subqueue: str) -> None:
-    await store.update_settings(user_id, queue=queue, subqueue=subqueue)
+async def sync_user_selection(user_id: int, queue: str, subqueue: str, region: str | None = None) -> None:
+    await store.update_settings(user_id, region=region, queue=queue, subqueue=subqueue)
 
 
 def _parse_queue_subqueue(raw: str) -> tuple[str, str] | None:
     import re
 
-    m = re.search(r"\b([1-6])\s*[\.\-]\s*([1-2])\b", raw)
+    m = re.search(r"\b(\d+)\s*[\.\-]\s*(\d+)\b", raw)
     if not m:
         return None
     return m.group(1), m.group(2)
@@ -667,7 +758,7 @@ async def notify_on_handler(message: Message) -> None:
     await store.update_settings(user_id, notifications_enabled=True)
     settings = await store.get_user(user_id)
     if settings.queue and settings.subqueue:
-        next_preview = _preview_next_event(settings.queue, settings.subqueue, settings.notify_before_minutes)
+        next_preview = _preview_next_event(settings.region, settings.queue, settings.subqueue, settings.notify_before_minutes)
         extra = f"\n\n{next_preview}" if next_preview else "\n\nНайближчих подій на сьогодні не знайдено."
         await message.answer(
             "🔔 Сповіщення увімкнено.\n"

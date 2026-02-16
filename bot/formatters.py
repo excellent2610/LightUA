@@ -54,7 +54,7 @@ def format_off_message(intervals: list[Any], city: str = "Черкаси") -> st
         return "🟢 СЬОГОДНІ ВІДКЛЮЧЕНЬ НЕМАЄ"  # modified
 
     body = "\n".join(lines)
-    return f"🟢 СВІТЛО Є ({city})\n\n{body}\n\nДжерело: {SOURCE_LABEL}"
+    return f"🔴 ВІДКЛЮЧЕННЯ СВІТЛА ({city})\n\n{body}\n\nДжерело: {SOURCE_LABEL}"
 
 
 def format_on_message(intervals: list[Any], city: str = "Черкаси") -> str:  # added
@@ -63,7 +63,7 @@ def format_on_message(intervals: list[Any], city: str = "Черкаси") -> str
         return "🔴 СВІТЛА СЬОГОДНІ НЕ БУДЕ"
 
     body = "\n".join(lines)
-    return f"🔴 ВІДКЛЮЧЕННЯ СВІТЛА ({city})\n\n{body}\n\nДжерело: {SOURCE_LABEL}"
+    return f"🟢 СВІТЛО Є ({city})\n\n{body}\n\nДжерело: {SOURCE_LABEL}"
 
 
 # Compatibility aliases for existing handlers.
