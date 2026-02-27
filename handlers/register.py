@@ -59,7 +59,7 @@ async def begin_registration(
         logger.exception("Failed to fetch regions from alerts.org.ua")
         await message.answer(
             "Не вдалося завантажити список областей з alerts.org.ua.\n"
-            "Спробуйте пізніше командою /register."
+            "Спробуйте пізніше командою /start."
         )
         return
 
@@ -99,7 +99,7 @@ def get_router(db: Database, parser: AlertsParser | None = None) -> Router:
 
         parts = callback.data.split(":", maxsplit=2)
         if len(parts) != 3:
-            await callback.answer("Невірні дані кнопки. Спробуйте /register", show_alert=True)
+            await callback.answer("Невірні дані кнопки. Спробуйте /start", show_alert=True)
             return
 
         _, token, slug = parts
@@ -112,7 +112,7 @@ def get_router(db: Database, parser: AlertsParser | None = None) -> Router:
                     await callback.message.edit_reply_markup(reply_markup=None)
                 except Exception:
                     logger.debug("Failed to clear stale keyboard", exc_info=True)
-            await callback.answer("Це застарілий список областей. Використайте /register", show_alert=True)
+            await callback.answer("Це застарілий список областей. Використайте /start", show_alert=True)
             return
 
         region_map: dict[str, str] = state_data.get("region_map", {})
@@ -131,7 +131,7 @@ def get_router(db: Database, parser: AlertsParser | None = None) -> Router:
                 logger.debug("Failed to clear region keyboard", exc_info=True)
 
         if callback.message:
-            await callback.message.answer(f"Обрано: {region_name}\nВведіть номер черги (наприклад: 4):")
+            await callback.message.answer(f"Обрано: {region_name}\nВведіть номер черги (наприклад: 1):")
         await callback.answer()
 
     @router.callback_query(F.data.startswith("region:"))
@@ -141,7 +141,7 @@ def get_router(db: Database, parser: AlertsParser | None = None) -> Router:
                 await callback.message.edit_reply_markup(reply_markup=None)
             except Exception:
                 logger.debug("Failed to clear stale keyboard", exc_info=True)
-        await callback.answer("Список областей застарів. Використайте /register", show_alert=True)
+        await callback.answer("Список областей застарів. Використайте /start", show_alert=True)
 
     @router.message(RegisterStates.waiting_region, F.text & ~F.text.startswith("/"))
     async def waiting_region_text(message: Message) -> None:
@@ -185,7 +185,7 @@ def get_router(db: Database, parser: AlertsParser | None = None) -> Router:
 
         if not region_slug or not region_name or queue is None:
             await state.clear()
-            await message.answer("Стан реєстрації втрачено. Повторіть /register")
+            await message.answer("Стан реєстрації втрачено. Повторіть /start")
             return
 
         telegram_id = message.from_user.id
@@ -207,7 +207,8 @@ def get_router(db: Database, parser: AlertsParser | None = None) -> Router:
             "/notify_on - увімкнути сповіщення\n"
             "/notify_off - вимкнути сповіщення\n"
             "/quiet - налаштувати тиху годину\n"
-            "/status - переглянути профіль"
+            "/status - переглянути профіль\n"
+            "/help - показати довідку"
         )
         if parser is not None:
             await send_graph_for_user(

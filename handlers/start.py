@@ -58,7 +58,8 @@ def get_router(db: Database, parser: AlertsParser) -> Router:
             "/notify_off\n"
             "/quiet\n"
             "/status\n"
-            "/register"
+            "/register\n"
+            "/help"
         )
 
     return router

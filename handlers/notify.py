@@ -113,7 +113,7 @@ def get_router(db: Database) -> Router:
 
         user = await db.get_user(message.from_user.id)
         if user is None:
-            await message.answer("Спочатку завершіть реєстрацію: /register")
+            await message.answer("Спочатку завершіть реєстрацію: /s")
             return
 
         await db.set_notifications(message.from_user.id, True)
@@ -169,7 +169,7 @@ def get_router(db: Database) -> Router:
 
         user = await db.get_user(message.from_user.id)
         if user is None:
-            await message.answer("Спочатку завершіть реєстрацію: /register")
+            await message.answer("Спочатку завершіть реєстрацію: /start")
             return
 
         await message.answer("🧪 Тест заплановано. Тестове повідомлення прийде через 5 хвилин.")
@@ -195,7 +195,7 @@ def get_router(db: Database) -> Router:
 
         user = await db.get_user(message.from_user.id)
         if user is None:
-            await message.answer("Спочатку завершіть реєстрацію: /register")
+            await message.answer("Спочатку завершіть реєстрацію: /start")
             return
 
         await db.set_notifications(message.from_user.id, False)

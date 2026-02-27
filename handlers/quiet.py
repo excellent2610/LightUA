@@ -25,7 +25,7 @@ def get_router(db: Database) -> Router:
 
         user = await db.get_user(message.from_user.id)
         if user is None:
-            await message.answer("Спочатку завершіть реєстрацію: /register")
+            await message.answer("Спочатку завершіть реєстрацію: /start")
             return
 
         await state.clear()
@@ -71,7 +71,7 @@ def get_router(db: Database) -> Router:
         updated = await db.set_quiet_hours(message.from_user.id, quiet_start, quiet_end)
         await state.clear()
         if not updated:
-            await message.answer("Профіль не знайдено. Виконайте /register")
+            await message.answer("Профіль не знайдено. Виконайте /start")
             return
 
         await message.answer(f"Тиха година встановлена: {quiet_start} - {quiet_end}")

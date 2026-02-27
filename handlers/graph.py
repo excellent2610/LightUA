@@ -101,7 +101,7 @@ async def send_graph_for_user(
 ) -> None:
     user = await db.get_user(telegram_id)
     if user is None:
-        await message.answer("Ви ще не зареєстровані. Використайте /register")
+        await message.answer("Ви ще не зареєстровані. Використайте /start для початку.")
         return
 
     try:
