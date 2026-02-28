@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+import time
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -18,12 +19,27 @@ from parsing.regions import Region, fetch_regions
 from utils.formatting import normalize_region_label
 
 logger = logging.getLogger(__name__)
+_REGISTER_DEDUP_WINDOW_SECONDS = 2.0
+_last_register_event_by_user: dict[tuple[int, str], tuple[str, float]] = {}
 
 
 class RegisterStates(StatesGroup):
     waiting_region = State()
     waiting_queue = State()
     waiting_subqueue = State()
+
+
+def _is_recent_duplicate(*, user_id: int, step: str, payload: str) -> bool:
+    now = time.monotonic()
+    key = (user_id, step)
+    previous = _last_register_event_by_user.get(key)
+    if previous is None:
+        _last_register_event_by_user[key] = (payload, now)
+        return False
+
+    previous_payload, previous_ts = previous
+    _last_register_event_by_user[key] = (payload, now)
+    return payload == previous_payload and (now - previous_ts) <= _REGISTER_DEDUP_WINDOW_SECONDS
 
 
 async def begin_registration(
@@ -89,11 +105,24 @@ def get_router(db: Database, parser: AlertsParser | None = None) -> Router:
 
     @router.message(Command(commands=["start", "register"]))
     async def register_command(message: Message, state: FSMContext) -> None:
+        if message.from_user is not None and _is_recent_duplicate(
+            user_id=message.from_user.id,
+            step="start",
+            payload=(message.text or "").strip().lower(),
+        ):
+            return
         await begin_registration(message=message, state=state, db=db, reset_existing=True)
 
     @router.callback_query(RegisterStates.waiting_region, F.data.startswith("region:"))
     async def region_callback(callback: CallbackQuery, state: FSMContext) -> None:
         if callback.data is None:
+            await callback.answer()
+            return
+        if callback.from_user is not None and _is_recent_duplicate(
+            user_id=callback.from_user.id,
+            step="region_callback",
+            payload=callback.data,
+        ):
             await callback.answer()
             return
 
@@ -149,6 +178,12 @@ def get_router(db: Database, parser: AlertsParser | None = None) -> Router:
 
     @router.message(RegisterStates.waiting_queue, F.text & ~F.text.startswith("/"))
     async def queue_input(message: Message, state: FSMContext) -> None:
+        if message.from_user is not None and _is_recent_duplicate(
+            user_id=message.from_user.id,
+            step="queue_input",
+            payload=(message.text or "").strip(),
+        ):
+            return
         value = (message.text or "").strip()
         if not value.isdigit():
             await message.answer("Черга має бути числом. Спробуйте ще раз:")
@@ -166,6 +201,12 @@ def get_router(db: Database, parser: AlertsParser | None = None) -> Router:
     @router.message(RegisterStates.waiting_subqueue, F.text & ~F.text.startswith("/"))
     async def subqueue_input(message: Message, state: FSMContext) -> None:
         if message.from_user is None:
+            return
+        if _is_recent_duplicate(
+            user_id=message.from_user.id,
+            step="subqueue_input",
+            payload=(message.text or "").strip(),
+        ):
             return
 
         value = (message.text or "").strip()
