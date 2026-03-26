@@ -6,6 +6,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+ADMINS: list[int] = [8608243726]  # замініть на реальні Telegram user_id
+
 
 @dataclass(slots=True)
 class Settings:

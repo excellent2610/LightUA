@@ -23,6 +23,8 @@ _USERS_COLUMN_ALTERS: dict[str, str] = {
     "notifications_enabled": "ALTER TABLE users ADD COLUMN notifications_enabled INTEGER NOT NULL DEFAULT 0",
     "quiet_start": "ALTER TABLE users ADD COLUMN quiet_start TEXT NULL",
     "quiet_end": "ALTER TABLE users ADD COLUMN quiet_end TEXT NULL",
+    "first_seen": "ALTER TABLE users ADD COLUMN first_seen TEXT NULL",
+    "last_active": "ALTER TABLE users ADD COLUMN last_active TEXT NULL",
 }
 
 _LAST_STATE_COLUMN_ALTERS: dict[str, str] = {
@@ -39,6 +41,8 @@ _USERS_REQUIRED_COLUMNS = {
     "notifications_enabled",
     "quiet_start",
     "quiet_end",
+    "first_seen",
+    "last_active",
 }
 
 _LAST_STATE_REQUIRED_COLUMNS = {
@@ -74,13 +78,15 @@ class Database:
         subqueue: int,
     ) -> None:
         query = """
-        INSERT INTO users (telegram_id, region_slug, region_name, queue, subqueue)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO users (telegram_id, region_slug, region_name, queue, subqueue, first_seen, last_active)
+        VALUES (?, ?, ?, ?, ?, datetime('now','localtime'), datetime('now','localtime'))
         ON CONFLICT(telegram_id) DO UPDATE SET
             region_slug = excluded.region_slug,
             region_name = excluded.region_name,
             queue = excluded.queue,
-            subqueue = excluded.subqueue
+            subqueue = excluded.subqueue,
+            first_seen = COALESCE(users.first_seen, excluded.first_seen),
+            last_active = excluded.last_active
         """
         await self._execute_write(
             query,
@@ -175,6 +181,35 @@ class Database:
 
     async def delete_last_state(self, telegram_id: int) -> None:
         await self._execute_write("DELETE FROM last_state WHERE telegram_id = ?", (telegram_id,))
+
+    async def touch_user_activity(self, telegram_id: int) -> None:
+        query = """
+        UPDATE users
+        SET last_active = datetime('now','localtime'),
+            first_seen = COALESCE(first_seen, datetime('now','localtime'))
+        WHERE telegram_id = ?
+        """
+        await self._execute_write(query, (telegram_id,))
+
+    async def _fetch_scalar_int(self, query: str, params: tuple = ()) -> int:
+        row = await self._fetchone(query, params)
+        if row is None:
+            return 0
+        return int(row[0] or 0)
+
+    async def get_bot_stats(self) -> dict[str, int]:
+        total = await self._fetch_scalar_int("SELECT COUNT(*) FROM users")
+        new_today = await self._fetch_scalar_int(
+            "SELECT COUNT(*) FROM users WHERE date(first_seen) = date('now','localtime')"
+        )
+        active_24h = await self._fetch_scalar_int(
+            "SELECT COUNT(*) FROM users WHERE last_active >= datetime('now','-1 day')"
+        )
+        return {
+            "total": total,
+            "new_today": new_today,
+            "active_24h": active_24h,
+        }
 
     async def _fetchone(self, query: str, params: tuple) -> Optional[aiosqlite.Row]:
         async with self._connect() as connection:
