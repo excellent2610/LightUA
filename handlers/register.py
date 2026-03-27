@@ -9,6 +9,7 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.filters import StateFilter
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -27,6 +28,11 @@ class RegisterStates(StatesGroup):
     waiting_region = State()
     waiting_queue = State()
     waiting_subqueue = State()
+
+
+def _is_command_message(message: Message) -> bool:
+    text = message.text or ""
+    return text.startswith("/")
 
 
 def _is_recent_duplicate(*, user_id: int, step: str, payload: str) -> bool:
@@ -103,7 +109,7 @@ async def begin_registration(
 def get_router(db: Database, parser: AlertsParser | None = None) -> Router:
     router = Router(name="register")
 
-    @router.message(Command(commands=["start", "register"]))
+    @router.message(Command(commands=["start", "register"]), StateFilter("*"))
     async def register_command(message: Message, state: FSMContext) -> None:
         if message.from_user is not None and _is_recent_duplicate(
             user_id=message.from_user.id,
@@ -174,10 +180,14 @@ def get_router(db: Database, parser: AlertsParser | None = None) -> Router:
 
     @router.message(RegisterStates.waiting_region, F.text & ~F.text.startswith("/"))
     async def waiting_region_text(message: Message) -> None:
+        if _is_command_message(message):
+            return
         await message.answer("Будь ласка, оберіть область кнопкою нижче.")
 
     @router.message(RegisterStates.waiting_queue, F.text & ~F.text.startswith("/"))
     async def queue_input(message: Message, state: FSMContext) -> None:
+        if _is_command_message(message):
+            return
         if message.from_user is not None and _is_recent_duplicate(
             user_id=message.from_user.id,
             step="queue_input",
@@ -200,6 +210,8 @@ def get_router(db: Database, parser: AlertsParser | None = None) -> Router:
 
     @router.message(RegisterStates.waiting_subqueue, F.text & ~F.text.startswith("/"))
     async def subqueue_input(message: Message, state: FSMContext) -> None:
+        if _is_command_message(message):
+            return
         if message.from_user is None:
             return
         if _is_recent_duplicate(

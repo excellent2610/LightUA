@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timedelta
 
 from aiogram import Router
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.types import Message
 
 from bot.config import load_settings
@@ -17,6 +17,7 @@ from parsing.alerts_parser import (
     RegionUnavailableError,
     ScheduleNotFoundError,
 )
+from utils.ads import get_ad_manager
 from utils.formatting import format_graph_message
 from utils.time_utils import now_kyiv
 
@@ -91,10 +92,13 @@ def _build_notify_on_text(
 
 def get_router(db: Database) -> Router:
     router = Router(name="notify")
+    ad_manager = get_ad_manager()
 
-    @router.message(Command("help"))
+    @router.message(Command("help"), StateFilter("*"))
     async def help_command(message: Message) -> None:
-        await message.answer(
+        await ad_manager.send_with_ad(
+            message.bot,
+            message.chat.id,
             "Команди:\n"
             "/start - почати / змінити профіль\n"
             "/graph - графік на сьогодні\n"
@@ -106,14 +110,18 @@ def get_router(db: Database) -> Router:
             "/help - показати цю довідку"
         )
 
-    @router.message(Command("notify_on"))
+    @router.message(Command("notify_on"), StateFilter("*"))
     async def notify_on(message: Message) -> None:
         if message.from_user is None:
             return
 
         user = await db.get_user(message.from_user.id)
         if user is None:
-            await message.answer("Спочатку завершіть реєстрацію: /s")
+            await ad_manager.send_with_ad(
+                message.bot,
+                message.chat.id,
+                "Спочатку завершіть реєстрацію: /s",
+            )
             return
 
         await db.set_notifications(message.from_user.id, True)
@@ -130,7 +138,9 @@ def get_router(db: Database) -> Router:
             schedule.region_name = user.region_name
             current_state = schedule.state_at(now_kyiv())
             full_graph_text = format_graph_message(schedule=schedule, current_state=current_state)
-            await message.answer(
+            await ad_manager.send_with_ad(
+                message.bot,
+                message.chat.id,
                 _build_notify_on_text(
                     region_name=user.region_name,
                     queue=user.queue,
@@ -139,7 +149,9 @@ def get_router(db: Database) -> Router:
                 )
             )
         except EmergencyOutageError:
-            await message.answer(
+            await ad_manager.send_with_ad(
+                message.bot,
+                message.chat.id,
                 "🔔 Сповіщення увімкнено.\n"
                 f"{user.region_name} · Черга {user.queue}.{user.subqueue}\n"
                 "Попередження за 5 хв.\n\n"
@@ -147,7 +159,9 @@ def get_router(db: Database) -> Router:
                 "Недоступно через аварійні відключення"
             )
         except (ScheduleNotFoundError, RegionUnavailableError):
-            await message.answer(
+            await ad_manager.send_with_ad(
+                message.bot,
+                message.chat.id,
                 "🔔 Сповіщення увімкнено.\n"
                 f"{user.region_name} · Черга {user.queue}.{user.subqueue}\n"
                 "Попередження за 5 хв.\n\n"
@@ -156,29 +170,40 @@ def get_router(db: Database) -> Router:
             )
         except Exception:
             logger.exception("Failed to build next warning in /notify_on")
-            await message.answer(
+            await ad_manager.send_with_ad(
+                message.bot,
+                message.chat.id,
                 "🔔 Сповіщення увімкнено.\n"
                 f"{user.region_name} · Черга {user.queue}.{user.subqueue}\n"
                 "Попередження за 5 хв."
             )
 
-    @router.message(Command("notify_test"))
+    @router.message(Command("notify_test"), StateFilter("*"))
     async def notify_test(message: Message) -> None:
         if message.from_user is None:
             return
 
         user = await db.get_user(message.from_user.id)
         if user is None:
-            await message.answer("Спочатку завершіть реєстрацію: /start")
+            await ad_manager.send_with_ad(
+                message.bot,
+                message.chat.id,
+                "Спочатку завершіть реєстрацію: /start",
+            )
             return
 
-        await message.answer("🧪 Тест заплановано. Тестове повідомлення прийде через 5 хвилин.")
+        await ad_manager.send_with_ad(
+            message.bot,
+            message.chat.id,
+            "🧪 Тест заплановано. Тестове повідомлення прийде через 5 хвилин.",
+        )
 
         async def send_delayed_test() -> None:
             await asyncio.sleep(5 * 60)
-            await message.bot.send_message(
-                chat_id=message.chat.id,
-                text=(
+            await ad_manager.send_with_ad(
+                message.bot,
+                message.chat.id,
+                (
                     "🧪 ТЕСТ СПОВІЩЕННЯ\n"
                     "Це перевірка доставки push-повідомлень.\n\n"
                     "Черкаська область · Черга 4.1\n"
@@ -188,17 +213,25 @@ def get_router(db: Database) -> Router:
 
         asyncio.create_task(send_delayed_test())
 
-    @router.message(Command("notify_off"))
+    @router.message(Command("notify_off"), StateFilter("*"))
     async def notify_off(message: Message) -> None:
         if message.from_user is None:
             return
 
         user = await db.get_user(message.from_user.id)
         if user is None:
-            await message.answer("Спочатку завершіть реєстрацію: /start")
+            await ad_manager.send_with_ad(
+                message.bot,
+                message.chat.id,
+                "Спочатку завершіть реєстрацію: /start",
+            )
             return
 
         await db.set_notifications(message.from_user.id, False)
-        await message.answer("Сповіщення вимкнено.")
+        await ad_manager.send_with_ad(
+            message.bot,
+            message.chat.id,
+            "Сповіщення вимкнено.",
+        )
 
     return router

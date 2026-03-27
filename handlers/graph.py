@@ -5,7 +5,7 @@ import logging
 import re
 
 from aiogram import Router
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.types import Message
 
 from db.database import Database
@@ -15,6 +15,7 @@ from parsing.alerts_parser import (
     RegionUnavailableError,
     ScheduleNotFoundError,
 )
+from utils.ads import AdManager, get_ad_manager
 from utils.formatting import format_graph_message
 from utils.time_utils import now_kyiv
 
@@ -97,11 +98,19 @@ async def send_graph_for_user(
     db: Database,
     parser: AlertsParser,
     telegram_id: int,
+    ad_manager: AdManager | None = None,
     compact: bool = False,
 ) -> None:
+    if ad_manager is None:
+        ad_manager = get_ad_manager()
+
     user = await db.get_user(telegram_id)
     if user is None:
-        await message.answer("Ви ще не зареєстровані. Використайте /start для початку.")
+        await ad_manager.send_with_ad(
+            message.bot,
+            message.chat.id,
+            "Ви ще не зареєстровані. Використайте /start для початку.",
+        )
         return
 
     try:
@@ -118,29 +127,42 @@ async def send_graph_for_user(
             compact_messages = _build_compact_graph_messages(full_graph_text=full_graph_text, current_state=current_state)
             if compact_messages:
                 for text in compact_messages:
-                    await message.answer(text)
+                    await ad_manager.send_with_ad(message.bot, message.chat.id, text)
                 return
-        await message.answer(full_graph_text)
+        await ad_manager.send_with_ad(message.bot, message.chat.id, full_graph_text)
     except EmergencyOutageError:
-        await message.answer(
-            "⚠️ Зафіксовано аварійні відключення. Плановий графік тимчасово може не відповідати фактичному стану."
+        await ad_manager.send_with_ad(
+            message.bot,
+            message.chat.id,
+            "⚠️ Зафіксовано аварійні відключення. Плановий графік тимчасово може не відповідати фактичному стану.",
         )
     except ScheduleNotFoundError:
-        await message.answer(
+        await ad_manager.send_with_ad(
+            message.bot,
+            message.chat.id,
             "ℹ️ На сьогодні графік для вибраної області/черги не знайдено.\n"
-            "Ймовірно, планові відключення не застосовуються або дані ще не опубліковані."
+            "Ймовірно, планові відключення не застосовуються або дані ще не опубліковані.",
         )
     except RegionUnavailableError:
-        await message.answer("⚠️ Сторінка області тимчасово недоступна. Спробуйте пізніше.")
+        await ad_manager.send_with_ad(
+            message.bot,
+            message.chat.id,
+            "⚠️ Сторінка області тимчасово недоступна. Спробуйте пізніше.",
+        )
     except Exception:
         logger.exception("Unexpected parser failure in /graph")
-        await message.answer("Сталася помилка під час отримання графіка. Спробуйте пізніше.")
+        await ad_manager.send_with_ad(
+            message.bot,
+            message.chat.id,
+            "Сталася помилка під час отримання графіка. Спробуйте пізніше.",
+        )
 
 
 def get_router(db: Database, parser: AlertsParser) -> Router:
     router = Router(name="graph")
+    ad_manager = get_ad_manager()
 
-    @router.message(Command("graph"))
+    @router.message(Command("graph"), StateFilter("*"))
     async def graph_command(message: Message) -> None:
         if message.from_user is None:
             return
@@ -150,6 +172,7 @@ def get_router(db: Database, parser: AlertsParser) -> Router:
             db=db,
             parser=parser,
             telegram_id=message.from_user.id,
+            ad_manager=ad_manager,
             compact=True,
         )
 

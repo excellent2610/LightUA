@@ -4,13 +4,14 @@ import asyncio
 import logging
 
 from aiogram import Router
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from db.database import Database
 from handlers.register import begin_registration
 from parsing.alerts_parser import AlertsParser, ParserError, ScheduleNotFoundError
+from utils.ads import get_ad_manager
 from utils.formatting import format_light_change_message, format_status_message
 
 logger = logging.getLogger(__name__)
@@ -18,8 +19,9 @@ logger = logging.getLogger(__name__)
 
 def get_router(db: Database, parser: AlertsParser) -> Router:
     router = Router(name="start")
+    ad_manager = get_ad_manager()
 
-    @router.message(CommandStart())
+    @router.message(CommandStart(), StateFilter("*"))
     async def start_command(message: Message, state: FSMContext) -> None:
         if message.from_user is None:
             return
@@ -50,7 +52,9 @@ def get_router(db: Database, parser: AlertsParser) -> Router:
         except ParserError:
             logger.exception("Failed to fetch current state for /start user %s", telegram_id)
 
-        await message.answer(
+        await ad_manager.send_with_ad(
+            message.bot,
+            message.chat.id,
             f"{light_line}\n\n{status_line}\n\n"
             "Команди:\n"
             "/graph\n"
@@ -59,7 +63,7 @@ def get_router(db: Database, parser: AlertsParser) -> Router:
             "/quiet\n"
             "/status\n"
             "/register\n"
-            "/help"
+            "/help",
         )
 
     return router

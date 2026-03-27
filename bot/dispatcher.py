@@ -145,7 +145,6 @@ class UserActivityMiddleware(BaseMiddleware):
 def create_dispatcher(db: Database, parser: AlertsParser) -> Dispatcher:
     dispatcher = Dispatcher()
     dispatcher.update.outer_middleware(DropDuplicateUpdatesMiddleware())
-    dispatcher.update.outer_middleware(DropRepeatedCommandsMiddleware())
     dispatcher.update.outer_middleware(UserActivityMiddleware(db=db))
 
     dispatcher.include_router(get_register_router(db=db, parser=parser))

@@ -1,0 +1,19 @@
+{
+  "ads_enabled": false,
+  "show_every": 5,
+
+  "ads": [
+    {
+      "file": "ad1.json",
+      "enabled": true
+    },
+    {
+      "file": "ad2.json",
+      "enabled": true
+    },
+    {
+      "file": "ad3.json",
+      "enabled": true
+    }
+  ]
+}
