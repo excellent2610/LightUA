@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from aiogram import Bot
+from aiohttp import web
 from aiogram.types import BotCommand
 
 try:
@@ -97,6 +98,19 @@ async def configure_bot_commands(bot: Bot) -> None:
     )
 
 
+async def ping(request):
+    return web.Response(text="OK")
+
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/ping", ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 10000)
+    await site.start()
+
+
 async def run() -> None:
     settings = load_settings()
     configure_logging(settings.log_level)
@@ -126,6 +140,7 @@ async def run() -> None:
         await scheduler.start()
         await bot.delete_webhook(drop_pending_updates=True)
         await configure_bot_commands(bot)
+        await start_web_server()
 
         try:
             await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
