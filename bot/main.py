@@ -131,6 +131,7 @@ async def run() -> None:
             await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
         finally:
             await scheduler.stop()
+            await database.close()
             await bot.session.close()
 
 

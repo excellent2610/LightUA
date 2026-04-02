@@ -1,1 +1,0 @@
-# LightUA bot package.
