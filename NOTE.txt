@@ -7,3 +7,5 @@ yurash@185.203.241.243
 Database password = LightUA_2026_db
 
 postgresql://postgres:LightUA_2026_db@db.farjwrgaddslohxsmyqu.supabase.co:5432/postgres
+
+root@185.203.241.243

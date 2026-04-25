@@ -1,54 +1,65 @@
 # LightUA Telegram Bot
 
-Telegram-бот на Python для показу графіків відключень світла в Україні з парсингом `alerts.org.ua`.
+Telegram-бот на Python для відстеження стану світла за даними з `alerts.org.ua` та сповіщення користувачів у Telegram.
 
-## Можливості
+## Що вміє бот
 
-- Покрокова реєстрація: область -> черга -> підчерга
+- Реєстрація користувача: область -> черга -> підчерга
 - Команди:
   - `/start`
-  - `/register`
   - `/graph`
   - `/notify_on`
   - `/notify_off`
+  - `/notify_test`
   - `/quiet`
   - `/status`
-- Фоновий scheduler (кожні 60 секунд) з повідомленнями тільки при зміні стану
-- Тиха година (mute-інтервал)
-- SQLite з таблицями `users` і `last_state`
-- Асинхронний код (`aiogram 3`, `aiosqlite`)
+- Фоновий scheduler із перевіркою стану та повідомленням тільки при зміні
+- Тиха година для приглушення сповіщень
+- Збереження даних у SQLite
 
-## Архітектура
+## Актуальна структура проєкту
 
 ```text
 LightUA/
 ├── bot/
+│   ├── __init__.py
 │   ├── main.py
 │   ├── config.py
 │   ├── dispatcher.py
-│   ├── scheduler.py
-├── parsing/
-│   ├── regions.py
-│   ├── alerts_parser.py
-├── db/
-│   ├── database.py
-│   ├── models.py
+│   └── scheduler.py
 ├── handlers/
+│   ├── __init__.py
 │   ├── start.py
 │   ├── register.py
 │   ├── graph.py
 │   ├── notify.py
 │   ├── quiet.py
 │   ├── status.py
+│   └── admin.py
+├── parsing/
+│   ├── __init__.py
+│   ├── alerts_parser.py
+│   └── regions.py
+├── db/
+│   ├── __init__.py
+│   ├── database.py
+│   └── models.py
 ├── utils/
-│   ├── time_utils.py
+│   ├── __init__.py
 │   ├── formatting.py
-├── requirements.txt
+│   ├── time_utils.py
+│   └── ads.py
+├── add/
+│   ├── config.json
+│   ├── ad1.json
+│   └── ad2.json
 ├── .env.example
+├── requirements.txt
+├── Procfile
 └── README.md
 ```
 
-## Запуск локально
+## Локальний запуск
 
 1. Встановіть Python 3.10+.
 2. Встановіть залежності:
@@ -58,38 +69,44 @@ pip install -r requirements.txt
 ```
 
 3. Створіть `.env` на основі `.env.example` і заповніть `BOT_TOKEN`.
-4. Запустіть бот:
+4. Запустіть бота:
 
 ```bash
 python -m bot.main
 ```
 
-## Налаштування
-
-Змінні оточення:
+## Налаштування (`.env`)
 
 - `BOT_TOKEN` - токен Telegram-бота
-- `DB_PATH` - шлях до SQLite бази
-- `POLL_INTERVAL_SECONDS` - інтервал перевірки стану (мін. 30 сек)
-- `REQUEST_TIMEOUT_SECONDS` - таймаут HTTP до `alerts.org.ua`
+- `DB_PATH` - шлях до SQLite бази (за замовчуванням `lightua.db`)
+- `POLL_INTERVAL_SECONDS` - інтервал перевірки стану (мінімум 30)
+- `REQUEST_TIMEOUT_SECONDS` - timeout HTTP-запитів до `alerts.org.ua`
 - `LOG_LEVEL` - рівень логування (`DEBUG`, `INFO`, `WARNING`, `ERROR`)
 
-## Docker (опційно)
+Приклад:
 
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
-CMD ["python", "-m", "bot.main"]
+```env
+BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
+DB_PATH=lightua.db
+POLL_INTERVAL_SECONDS=60
+REQUEST_TIMEOUT_SECONDS=15
+LOG_LEVEL=INFO
 ```
 
-## Примітки щодо парсингу
+## Технічні деталі
 
-- Використовується лише `alerts.org.ua` (`requests + BeautifulSoup`)
-- Області не хардкодяться: збираються динамічно з сайту/мап сайтів
-- Обробляються кейси:
-  - відсутній графік
-  - аварійні відключення
-  - тимчасова недоступність сторінки
+- Фреймворк бота: `aiogram` (v3)
+- Тип роботи: `polling` (`dispatcher.start_polling`)
+- Токен читається з env (`os.getenv`)
+- Джерело даних: парсинг `alerts.org.ua` через `requests + BeautifulSoup`
+
+## Залежності
+
+Основні пакети з `requirements.txt`:
+
+- `aiogram`
+- `aiosqlite`
+- `beautifulsoup4`
+- `python-dotenv`
+- `requests`
+- `asyncpg`
