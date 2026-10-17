@@ -47,7 +47,8 @@ def format_graph_message(schedule: "DaySchedule", current_state: str) -> str:
         for interval in schedule.intervals:
             emoji = "🔴" if interval.state == "off" else "🟢"
             label = "Без світла" if interval.state == "off" else "Світло є"
-            lines.append(f"{emoji} {interval.start.strftime('%H:%M')} - {interval.end.strftime('%H:%M')} ({label})")
+            end_time = "24:00" if interval.ends_at_midnight else interval.end.strftime("%H:%M")
+            lines.append(f"{emoji} {interval.start.strftime('%H:%M')} - {end_time} ({label})")
 
     lines.append("")
     lines.append(f"Поточний стан: {format_light_change_message(current_state, region_name, schedule.queue, schedule.subqueue)}")

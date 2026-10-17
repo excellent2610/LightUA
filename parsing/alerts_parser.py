@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import date, datetime, time
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -15,6 +15,12 @@ BASE_URL = "https://alerts.org.ua"
 TIME_TOKEN_RE = r"(?:(?:[01]?\d|2[0-3]):[0-5]\d|24:00)"
 TIME_RANGE_RE = re.compile(rf"(?P<start>{TIME_TOKEN_RE})\s*[-–—]\s*(?P<end>{TIME_TOKEN_RE})")
 DATE_PAGE_RE = re.compile(r"/(?P<date>\d{4}-\d{2}-\d{2})\.html?$")
+TITLE_DATE_RE = re.compile(r"(?<!\d)(?P<day>\d{2})[.\-/](?P<month>\d{2})[.\-/](?P<year>\d{4})(?!\d)")
+UPDATED_RE = re.compile(
+    r"Оновлено\s*:\s*(?P<day>\d{2})[.](?P<month>\d{2})[.](?P<year>\d{4})"
+    r"\s*(?:о|об)\s*(?P<hour>\d{1,2}):(?P<minute>\d{2})",
+    re.IGNORECASE,
+)
 
 EMERGENCY_KEYWORDS = ("аварійн", "екстрен", "urgent blackout", "emergency")
 NO_SCHEDULE_KEYWORDS = (
@@ -23,6 +29,13 @@ NO_SCHEDULE_KEYWORDS = (
     "дані відсутні",
     "schedule unavailable",
     "schedule not found",
+)
+NO_OUTAGES_KEYWORDS = (
+    "відключень не заплановано",
+    "відключення не плануються",
+    "сьогодні відключень не буде",
+    "графік без відключень",
+    "no outages scheduled",
 )
 ANTI_BOT_KEYWORDS = (
     "please wait while your request is being verified",
@@ -54,6 +67,7 @@ class ScheduleInterval:
     start: time
     end: time
     state: str
+    ends_at_midnight: bool = False
 
 
 @dataclass(slots=True)
@@ -65,11 +79,15 @@ class DaySchedule:
     intervals: list[ScheduleInterval]
     default_state: str = "on"
     source_url: str | None = None
+    schedule_date: date | None = None
+    fetched_at: datetime | None = None
+    source_updated_at: datetime | None = None
+    confirmed_empty: bool = False
 
     def state_at(self, moment: datetime) -> str:
         local_time = moment.astimezone(KYIV_TZ).time()
         for interval in self.intervals:
-            if _time_in_interval(local_time, interval.start, interval.end):
+            if _time_in_interval(local_time, interval.start, interval.end, interval.ends_at_midnight):
                 return interval.state
         return self.default_state
 
@@ -102,10 +120,11 @@ class AlertsParser:
             raise EmergencyOutageError("Аварійні відключення")
 
         intervals = _extract_group_intervals(text=text, queue=queue, subqueue=subqueue)
+        confirmed_empty = any(keyword in normalized_text for keyword in NO_OUTAGES_KEYWORDS)
         source_url = region_url
         source_soup = soup
 
-        if not intervals:
+        if not intervals and not confirmed_empty:
             latest_url = self._find_latest_schedule_url(soup=soup, region_slug=region_slug)
             if latest_url:
                 latest_html = self._fetch_url(latest_url)
@@ -114,16 +133,18 @@ class AlertsParser:
                 latest_normalized = _normalize_text(latest_text)
                 if not _looks_like_anti_bot_page(latest_normalized):
                     intervals = _extract_group_intervals(text=latest_text, queue=queue, subqueue=subqueue)
-                    if intervals:
+                    confirmed_empty = any(keyword in latest_normalized for keyword in NO_OUTAGES_KEYWORDS)
+                    if intervals or confirmed_empty:
                         source_url = latest_url
                         source_soup = latest_soup
 
-        if not intervals:
+        if not intervals and not confirmed_empty:
             if any(keyword in normalized_text for keyword in NO_SCHEDULE_KEYWORDS):
                 raise ScheduleNotFoundError("Графік не опубліковано")
             raise ScheduleNotFoundError("Не знайдено інтервали для вибраної черги")
 
         region_name = self._extract_region_name(source_soup, region_slug)
+        schedule_date = _extract_schedule_date(source_soup, source_url)
         return DaySchedule(
             region_slug=region_slug,
             region_name=region_name,
@@ -132,6 +153,10 @@ class AlertsParser:
             intervals=intervals,
             default_state="on",
             source_url=source_url,
+            schedule_date=schedule_date,
+            fetched_at=now_kyiv(),
+            source_updated_at=_extract_source_updated_at(source_soup),
+            confirmed_empty=confirmed_empty,
         )
 
     def get_current_state(self, region_slug: str, queue: int, subqueue: int) -> tuple[str, DaySchedule]:
@@ -205,9 +230,9 @@ def _extract_group_intervals(text: str, queue: int, subqueue: int) -> list[Sched
         parsed.extend(_parse_intervals_from_block_lines(block))
 
     deduped: list[ScheduleInterval] = []
-    seen: set[tuple[time, time, str]] = set()
+    seen: set[tuple[time, time, str, bool]] = set()
     for item in parsed:
-        key = (item.start, item.end, item.state)
+        key = (item.start, item.end, item.state, item.ends_at_midnight)
         if key in seen:
             continue
         seen.add(key)
@@ -228,23 +253,27 @@ def _prepare_lines(text: str) -> list[str]:
 
 
 def _collect_target_blocks(lines: list[str], queue: int, subqueue: int) -> list[list[str]]:
-    blocks: list[list[str]] = []
-    target_header_re = re.compile(rf"\b(група|черга)\s*{queue}\s*[./-]\s*{subqueue}\b", flags=re.IGNORECASE)
-    generic_header_re = re.compile(r"\b(група|черга)\s*\d+\s*[./-]\s*\d+\b", flags=re.IGNORECASE)
-
+    header_re = re.compile(
+        r"^\s*(?:група|черга)\s*(?P<queue>\d+)(?:\s*[./-]\s*(?P<subqueue>\d+))?\b.*$",
+        flags=re.IGNORECASE,
+    )
+    headers: list[tuple[int, int, int | None]] = []
     for idx, line in enumerate(lines):
-        if not target_header_re.search(line):
-            continue
+        match = header_re.match(line)
+        if match:
+            headers.append((idx, int(match.group("queue")),
+                            int(match.group("subqueue")) if match.group("subqueue") else None))
 
-        block: list[str] = []
-        for j in range(idx + 1, min(len(lines), idx + 120)):
-            candidate = lines[j]
-            if generic_header_re.search(candidate):
-                break
-            block.append(candidate)
+    has_split_groups = any(group == queue and sub is not None for _, group, sub in headers)
+    blocks: list[list[str]] = []
+    for header_index, (line_index, group, sub) in enumerate(headers):
+        selected = (group == queue and sub == subqueue) if has_split_groups else (group == queue and sub is None)
+        if not selected:
+            continue
+        end_index = headers[header_index + 1][0] if header_index + 1 < len(headers) else min(len(lines), line_index + 120)
+        block = lines[line_index + 1:end_index]
         if block:
             blocks.append(block)
-
     return blocks
 
 
@@ -276,7 +305,9 @@ def _parse_intervals_from_block_lines(block_lines: list[str]) -> list[ScheduleIn
         if state is None:
             continue
 
-        result.append(ScheduleInterval(start=start, end=end, state=state))
+        result.append(ScheduleInterval(
+            start=start, end=end, state=state, ends_at_midnight=match.group("end") == "24:00"
+        ))
 
     return result
 
@@ -288,7 +319,9 @@ def _parse_time(raw: str) -> time:
     return datetime.strptime(value, "%H:%M").time()
 
 
-def _time_in_interval(current: time, start: time, end: time) -> bool:
+def _time_in_interval(current: time, start: time, end: time, ends_at_midnight: bool = False) -> bool:
+    if ends_at_midnight:
+        return current >= start
     if start == end:
         return True
     if start < end:
@@ -317,3 +350,37 @@ def _guess_state(text: str) -> str | None:
 
 def _looks_like_anti_bot_page(normalized_text: str) -> bool:
     return any(keyword in normalized_text for keyword in ANTI_BOT_KEYWORDS)
+
+
+def _extract_schedule_date(soup: BeautifulSoup, source_url: str) -> date | None:
+    """Return a date explicitly tied to the schedule page, never today's inferred date."""
+    path_match = DATE_PAGE_RE.search(urlparse(source_url).path.lower())
+    if path_match:
+        try:
+            return datetime.strptime(path_match.group("date"), "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    for element in (soup.find("title"), soup.find("h1")):
+        if element is None:
+            continue
+        match = TITLE_DATE_RE.search(" ".join(element.get_text(" ", strip=True).split()))
+        if match:
+            try:
+                return date(int(match.group("year")), int(match.group("month")), int(match.group("day")))
+            except ValueError:
+                continue
+    return None
+
+
+def _extract_source_updated_at(soup: BeautifulSoup) -> datetime | None:
+    match = UPDATED_RE.search(soup.get_text(" ", strip=True))
+    if not match:
+        return None
+    try:
+        return datetime(
+            int(match.group("year")), int(match.group("month")), int(match.group("day")),
+            int(match.group("hour")), int(match.group("minute")), tzinfo=KYIV_TZ,
+        )
+    except ValueError:
+        return None

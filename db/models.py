@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Optional
 
 
@@ -44,4 +45,19 @@ class User:
 class LastState:
     telegram_id: int
     last_light_state: str
-    last_checked_at: str
+    last_checked_at: datetime | str
+
+
+@dataclass(slots=True)
+class NoOutageNotificationEvent:
+    event_key: str
+    telegram_id: int
+    region_slug: str
+    queue: int
+    subqueue: int
+    schedule_date: date
+    schedule_fingerprint: str
+    event_type: str
+    status: str
+    attempt_count: int
+    last_attempt_at: datetime

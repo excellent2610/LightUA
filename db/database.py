@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import asyncpg
 
 from db.models import LastState, User
+from utils.time_utils import KYIV_TZ
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +33,37 @@ LAST_STATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS last_state (
     telegram_id BIGINT PRIMARY KEY,
     last_light_state TEXT,
-    last_checked_at TIMESTAMP
+    last_checked_at TIMESTAMP,
+    last_no_outages_event_key TEXT
+)
+"""
+
+SCHEDULE_SNAPSHOT_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS schedule_snapshots (
+    region_slug TEXT NOT NULL,
+    queue INTEGER NOT NULL,
+    subqueue INTEGER NOT NULL,
+    schedule_json TEXT NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (region_slug, queue, subqueue)
+)
+"""
+
+NO_OUTAGE_EVENTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS no_outage_notification_events (
+    event_key TEXT PRIMARY KEY,
+    telegram_id BIGINT NOT NULL,
+    region_slug TEXT NOT NULL,
+    queue INTEGER NOT NULL,
+    subqueue INTEGER NOT NULL,
+    schedule_date DATE NOT NULL,
+    schedule_fingerprint TEXT NOT NULL,
+    event_type TEXT NOT NULL DEFAULT 'no_outages',
+    status TEXT NOT NULL CHECK (status IN ('pending', 'sent', 'failed', 'unknown')),
+    attempt_count INTEGER NOT NULL DEFAULT 1,
+    last_attempt_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    last_error TEXT,
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 )
 """
 
@@ -59,6 +91,50 @@ class Database:
         async with self._pool.acquire() as connection:
             await connection.execute(USERS_TABLE_SQL)
             await connection.execute(LAST_STATE_TABLE_SQL)
+            # Upgrade existing installations without dropping or rewriting state.
+            await connection.execute(
+                "ALTER TABLE last_state ADD COLUMN IF NOT EXISTS last_no_outages_event_key TEXT"
+            )
+            await connection.execute(SCHEDULE_SNAPSHOT_TABLE_SQL)
+            await connection.execute(NO_OUTAGE_EVENTS_TABLE_SQL)
+            await connection.execute(
+                "ALTER TABLE no_outage_notification_events "
+                "ADD COLUMN IF NOT EXISTS event_type TEXT NOT NULL DEFAULT 'no_outages'"
+            )
+
+    async def update_schedule_snapshot(
+        self, region_slug: str, queue: int, subqueue: int, schedule_json: str
+    ) -> str | None:
+        """Persist a profile's latest schedule and return its previous value, if any."""
+        pool = self._require_pool()
+        async with self._write_lock:
+            async with pool.acquire() as connection:
+                async with connection.transaction():
+                    # Serialize updates for this key, including the initial insert.
+                    await connection.execute(
+                        "SELECT pg_advisory_xact_lock(hashtext($1))",
+                        f"{region_slug}:{queue}.{subqueue}",
+                    )
+                    previous = await connection.fetchval(
+                        "SELECT schedule_json FROM schedule_snapshots "
+                        "WHERE region_slug = $1 AND queue = $2 AND subqueue = $3",
+                        region_slug,
+                        queue,
+                        subqueue,
+                    )
+                    await connection.execute(
+                        """INSERT INTO schedule_snapshots
+                           (region_slug, queue, subqueue, schedule_json, updated_at)
+                           VALUES ($1, $2, $3, $4, NOW())
+                           ON CONFLICT (region_slug, queue, subqueue) DO UPDATE SET
+                             schedule_json = EXCLUDED.schedule_json,
+                             updated_at = EXCLUDED.updated_at""",
+                        region_slug,
+                        queue,
+                        subqueue,
+                        schedule_json,
+                    )
+                    return previous
 
     async def upsert_user_registration(
         self,
@@ -176,7 +252,53 @@ class Database:
             last_light_state = EXCLUDED.last_light_state,
             last_checked_at = EXCLUDED.last_checked_at
         """
-        await self._execute_write(query, (telegram_id, state, checked_at_iso))
+        checked_at = datetime.fromisoformat(checked_at_iso)
+        if checked_at.tzinfo is not None:
+            # The existing column is TIMESTAMP WITHOUT TIME ZONE; store Kyiv wall time.
+            checked_at = checked_at.astimezone(KYIV_TZ).replace(tzinfo=None)
+        await self._execute_write(query, (telegram_id, state, checked_at))
+
+    async def claim_no_more_outages_notification(
+        self, *, event_key: str, telegram_id: int, region_slug: str,
+        queue: int, subqueue: int, schedule_date, schedule_fingerprint: str,
+        retry_after_seconds: int = 300, event_type: str = "no_outages",
+    ) -> bool:
+        """Atomically reserve one event; only confirmed failures may be retried."""
+        pool = self._require_pool()
+        async with self._write_lock:
+            async with pool.acquire() as connection:
+                claimed = await connection.fetchval(
+                    """INSERT INTO no_outage_notification_events
+                       (event_key, telegram_id, region_slug, queue, subqueue, schedule_date,
+                        schedule_fingerprint, event_type, status, attempt_count, last_attempt_at)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', 1, NOW())
+                       ON CONFLICT (event_key) DO UPDATE SET
+                         status = 'pending', attempt_count = no_outage_notification_events.attempt_count + 1,
+                         region_slug = EXCLUDED.region_slug, queue = EXCLUDED.queue,
+                         subqueue = EXCLUDED.subqueue, schedule_date = EXCLUDED.schedule_date,
+                         schedule_fingerprint = EXCLUDED.schedule_fingerprint,
+                         event_type = EXCLUDED.event_type,
+                         last_attempt_at = NOW(), last_error = NULL, updated_at = NOW()
+                       WHERE no_outage_notification_events.status = 'failed'
+                         AND no_outage_notification_events.last_attempt_at <=
+                             NOW() - ($9 * INTERVAL '1 second')
+                       RETURNING event_key""",
+                    event_key, telegram_id, region_slug, queue, subqueue, schedule_date,
+                    schedule_fingerprint, event_type, retry_after_seconds,
+                )
+                return claimed is not None
+
+    async def finish_no_more_outages_notification(
+        self, event_key: str, status: str, error: str | None = None
+    ) -> None:
+        if status not in {"sent", "failed", "unknown"}:
+            raise ValueError(f"Invalid notification status: {status}")
+        await self._execute_write(
+            """UPDATE no_outage_notification_events
+               SET status = $2, last_error = $3, updated_at = NOW()
+               WHERE event_key = $1 AND status = 'pending'""",
+            (event_key, status, error[:1000] if error else None),
+        )
 
     async def delete_last_state(self, telegram_id: int) -> None:
         await self._execute_write("DELETE FROM last_state WHERE telegram_id = $1", (telegram_id,))
