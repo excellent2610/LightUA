@@ -224,8 +224,23 @@ class LightStateScheduler:
             intervals = value
         return schedule_date, json.dumps(intervals, ensure_ascii=False, separators=(",", ":"))
 
+    @staticmethod
+    def _format_schedule_update(queue: int, subqueue: int, intervals: list) -> str:
+        lines = ["🔄 Графік оновлено!", "", f"⚡ Черга {queue}.{subqueue}"]
+        ordered = sorted(intervals, key=lambda item: item[0])
+        for start, end, state in ordered:
+            if end == "00:00" and start != "00:00":
+                end = "24:00"
+            label = "світло є" if state == "on" else "без світла"
+            emoji = "🟢" if state == "on" else "🔴"
+            lines.append(f"{emoji} {start}–{end} ({label})")
+        if not ordered:
+            lines.append("ℹ️ Інтервали графіка відсутні.")
+        lines.extend(["", "📲 Перевірте актуальний графік у боті."])
+        return "\n".join(lines)
+
     async def _notify_schedule_change(
-        self, users: list[User], schedule: DaySchedule, previous_json: str, now: datetime
+        self, users: list[User], schedule: DaySchedule, now: datetime
     ) -> None:
         eligible = [
             user for user in users
@@ -237,28 +252,8 @@ class LightStateScheduler:
                 schedule.region_slug, schedule.queue, schedule.subqueue,
             )
             return
-        try:
-            previous = set(tuple(item) for item in json.loads(previous_json))
-            current = set(tuple(item) for item in json.loads(self._schedule_fingerprint(schedule)))
-            added, removed = sorted(current - previous), sorted(previous - current)
-            if added or removed:
-                lines = ["🔄 Графік змінився!", "", f"⚡ Черга {schedule.queue}.{schedule.subqueue}"]
-                label = lambda item: f"{item[0]}–{item[1]} ({'без світла' if item[2] == 'off' else 'світло є'})"
-                if added:
-                    lines.extend(["", "➕ Додано:"] + [label(item) for item in added])
-                if removed:
-                    lines.extend(["", "➖ Скасовано:"] + [label(item) for item in removed])
-                lines.extend(["", "Перевірте актуальний графік у боті."])
-                text = "\n".join(lines)
-            else:
-                raise ValueError("No interval delta")
-        except (ValueError, TypeError, json.JSONDecodeError):
-            from utils.formatting import format_graph_message
-
-            text = (
-                f"🔄 Графік для вашої черги {schedule.queue}.{schedule.subqueue} було оновлено.\n\n"
-                "📅 Новий графік:\n" + format_graph_message(schedule, schedule.state_at(now), now=now)
-            )
+        current = json.loads(self._schedule_fingerprint(schedule))
+        text = self._format_schedule_update(schedule.queue, schedule.subqueue, current)
         errors = 0
         for user in eligible:
             try:
@@ -283,20 +278,10 @@ class LightStateScheduler:
             if delivery is None:
                 break
             try:
-                previous = json.loads(delivery.previous_json)
                 current = json.loads(delivery.current_json)
-                prev_intervals = previous.get("intervals", previous) if isinstance(previous, dict) else previous
                 curr_intervals = current.get("intervals", current) if isinstance(current, dict) else current
-                before, after = set(map(tuple, prev_intervals)), set(map(tuple, curr_intervals))
-                added, removed = sorted(after - before), sorted(before - after)
-                lines = ["🔄 Графік змінився!", "", f"⚡ Черга {delivery.queue}.{delivery.subqueue}"]
-                label = lambda item: f"{item[0]}–{item[1]} ({'без світла' if item[2] == 'off' else 'світло є'})"
-                if added:
-                    lines.extend(["", "➕ Додано:"] + [label(item) for item in added])
-                if removed:
-                    lines.extend(["", "➖ Скасовано:"] + [label(item) for item in removed])
-                lines.extend(["", "Перевірте актуальний графік у боті."])
-                await self._bot.send_message(chat_id=delivery.recipient_id, text="\n".join(lines))
+                text = self._format_schedule_update(delivery.queue, delivery.subqueue, curr_intervals)
+                await self._bot.send_message(chat_id=delivery.recipient_id, text=text)
             except Exception as exc:
                 delay = min(3600, 30 * (2 ** min(delivery.attempt_count - 1, 7)))
                 try:

@@ -182,7 +182,7 @@ class FakeBot:
         message = str(kwargs.get("text", ""))
         if self.failure is not None and (
             "більше немає запланованих" in message or "☀️ Графік відключень" in message
-            or "🔄 Графік змінився!" in message
+            or "🔄 Графік оновлено!" in message
         ):
             failure, self.failure = self.failure, None
             raise failure
@@ -752,7 +752,7 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
                 await self.scheduler._check_profile(profile, [user], semaphore)
                 await self.scheduler._drain_schedule_change_outbox()
 
-        changes = [m for m in self.bot.messages if "🔄 Графік змінився!" in str(m["text"])]
+        changes = [m for m in self.bot.messages if "🔄 Графік оновлено!" in str(m["text"])]
         self.assertEqual(changes, [])
 
     async def test_incomplete_source_cycle_does_not_replace_same_day_snapshot(self) -> None:
@@ -795,7 +795,7 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
 
         self.parser.schedules[profile] = schedule
         await run_at(after_eight)
-        changes = [m for m in self.bot.messages if "🔄 Графік змінився!" in str(m["text"])]
+        changes = [m for m in self.bot.messages if "🔄 Графік оновлено!" in str(m["text"])]
         self.assertEqual(changes, [])
 
     async def test_incomplete_responses_then_recovery_and_real_change(self) -> None:
@@ -844,26 +844,36 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
                 await run_at(moment)
                 self.assertEqual(self.db.snapshots[profile], saved_snapshot)
                 self.assertEqual(self.db.checked_at[user.telegram_id], saved_user_check)
-                self.assertFalse(any("🔄 Графік змінився!" in str(m["text"]) for m in self.bot.messages))
+                self.assertFalse(any("🔄 Графік оновлено!" in str(m["text"]) for m in self.bot.messages))
                 self.assertEqual(self.db.final_events, {})
         self.assertEqual(sum("Parser error for profile" in line for line in warnings.output), 2)
 
         self.parser.schedules[profile] = valid
         await run_at(datetime(2026, 10, 18, 8, 2, tzinfo=KYIV))
         self.assertEqual(self.db.snapshots[profile], saved_snapshot)
-        self.assertFalse(any("🔄 Графік змінився!" in str(m["text"]) for m in self.bot.messages))
+        self.assertFalse(any("🔄 Графік оновлено!" in str(m["text"]) for m in self.bot.messages))
 
         self.parser.schedules[profile] = schedule(changed=True)
         await run_at(datetime(2026, 10, 18, 8, 3, tzinfo=KYIV))
-        self.assertFalse(any("🔄 Графік змінився!" in str(m["text"]) for m in self.bot.messages))
+        self.assertFalse(any("🔄 Графік оновлено!" in str(m["text"]) for m in self.bot.messages))
         await run_at(datetime(2026, 10, 18, 8, 4, tzinfo=KYIV))
-        changes = [m for m in self.bot.messages if "🔄 Графік змінився!" in str(m["text"])]
+        changes = [m for m in self.bot.messages if "🔄 Графік оновлено!" in str(m["text"])]
         self.assertEqual(len(changes), 1)
-        self.assertIn("06:00–08:00 (без світла)", str(changes[0]["text"]))
-        self.assertIn("06:00–09:00 (без світла)", str(changes[0]["text"]))
+        message = str(changes[0]["text"])
+        self.assertIn("🔄 Графік оновлено!", message)
+        self.assertIn("⚡ Черга 2.1", message)
+        self.assertIn(
+            "🟢 00:00–06:00 (світло є)\n🔴 06:00–09:00 (без світла)\n"
+            "🟢 09:00–16:00 (світло є)\n🔴 16:00–20:00 (без світла)\n"
+            "🟢 20:00–24:00 (світло є)",
+            message,
+        )
+        self.assertIn("📲 Перевірте актуальний графік у боті.", message)
+        self.assertNotIn("➕ Додано", message)
+        self.assertNotIn("➖ Скасовано", message)
 
         await run_at(datetime(2026, 10, 18, 8, 5, tzinfo=KYIV))
-        changes = [m for m in self.bot.messages if "🔄 Графік змінився!" in str(m["text"])]
+        changes = [m for m in self.bot.messages if "🔄 Графік оновлено!" in str(m["text"])]
         self.assertEqual(len(changes), 1)
 
     async def test_snapshot_date_change_starts_a_new_baseline(self) -> None:
@@ -892,7 +902,7 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
             self.parser.schedules[profile] = next_day
             await self.scheduler._check_profile(profile, [user], semaphore)
 
-        changes = [m for m in self.bot.messages if "🔄 Графік змінився!" in str(m["text"])]
+        changes = [m for m in self.bot.messages if "🔄 Графік оновлено!" in str(m["text"])]
         self.assertEqual(changes, [])
 
     async def test_missing_source_date_uses_kyiv_observation_date(self) -> None:
@@ -919,7 +929,7 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
 
         await run_at(first, datetime(2026, 10, 18, 23, 59, tzinfo=KYIV))
         await run_at(next_day_different, datetime(2026, 10, 19, 0, 1, tzinfo=KYIV))
-        self.assertFalse(any("🔄 Графік змінився!" in str(m["text"]) for m in self.bot.messages))
+        self.assertFalse(any("🔄 Графік оновлено!" in str(m["text"]) for m in self.bot.messages))
 
     async def test_fingerprint_detects_real_future_interval_changes(self) -> None:
         original = DaySchedule("region-a", "region-a", 2, 1,
@@ -966,12 +976,12 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
         restarted = LightStateScheduler(self.bot, self.db, self.parser)
         self.parser.schedules[target] = make_schedule(*target, start=0)
         await self._check(restarted)  # Reversion clears candidate.
-        self.assertFalse(any("🔄 Графік змінився!" in str(m["text"]) for m in self.bot.messages))
+        self.assertFalse(any("🔄 Графік оновлено!" in str(m["text"]) for m in self.bot.messages))
         self.parser.schedules[target] = make_schedule(*target, start=1)
         await self._check(restarted)
-        self.assertFalse(any("🔄 Графік змінився!" in str(m["text"]) for m in self.bot.messages))
+        self.assertFalse(any("🔄 Графік оновлено!" in str(m["text"]) for m in self.bot.messages))
         await self._check(restarted)
-        changes = [m for m in self.bot.messages if "🔄 Графік змінився!" in str(m["text"])]
+        changes = [m for m in self.bot.messages if "🔄 Графік оновлено!" in str(m["text"])]
         self.assertEqual(len(changes), 2)  # Two recipients, one logical confirmed event.
 
     async def test_source_error_does_not_confirm_or_clear_candidate(self) -> None:
@@ -982,10 +992,10 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
         self.parser.schedules[target] = ParserError("temporary source failure")
         with self.assertLogs("bot.scheduler", level="WARNING"):
             await self._check(self.scheduler)
-        self.assertFalse(any("🔄 Графік змінився!" in str(m["text"]) for m in self.bot.messages))
+        self.assertFalse(any("🔄 Графік оновлено!" in str(m["text"]) for m in self.bot.messages))
         self.parser.schedules[target] = make_schedule(*target, start=1)
         await self._check(self.scheduler)  # Next successful match confirms once.
-        changes = [m for m in self.bot.messages if "🔄 Графік змінився!" in str(m["text"])]
+        changes = [m for m in self.bot.messages if "🔄 Графік оновлено!" in str(m["text"])]
         self.assertEqual(len(changes), 2)
 
     async def test_unconfirmed_candidate_is_not_used_for_user_state_or_notifications(self) -> None:
@@ -1061,9 +1071,14 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.messages, [])
         restarted = LightStateScheduler(self.bot, self.db, self.parser)
         await restarted._drain_schedule_change_outbox()
-        sent = [m for m in self.bot.messages if "🔄 Графік змінився!" in str(m["text"])]
+        sent = [m for m in self.bot.messages if "🔄 Графік оновлено!" in str(m["text"])]
         self.assertEqual(len(sent), 2)
         self.assertEqual({m["chat_id"] for m in sent}, {11, 12})
+        for delivery in sent:
+            message = str(delivery["text"])
+            self.assertIn("🔄 Графік оновлено!", message)
+            self.assertNotIn("➕ Додано", message)
+            self.assertNotIn("➖ Скасовано", message)
 
     async def test_repeated_confirmed_change_does_not_create_duplicate_event(self) -> None:
         await self._check(self.scheduler)
