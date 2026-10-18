@@ -61,3 +61,14 @@ class NoOutageNotificationEvent:
     status: str
     attempt_count: int
     last_attempt_at: datetime
+
+
+@dataclass(slots=True)
+class ScheduleChangeDelivery:
+    event_id: int
+    recipient_id: int
+    previous_json: str
+    current_json: str
+    queue: int
+    subqueue: int
+    attempt_count: int

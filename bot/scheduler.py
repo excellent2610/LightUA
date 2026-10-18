@@ -12,7 +12,7 @@ from aiogram import Bot
 
 from db.database import Database
 from db.models import User
-from parsing.alerts_parser import AlertsParser, DaySchedule, ParserError
+from parsing.alerts_parser import AlertsParser, DaySchedule, ParserError, _canonical_day_intervals
 from utils.formatting import format_light_change_message
 from utils.time_utils import KYIV_TZ, is_in_quiet_hours, now_kyiv, parse_hhmm
 
@@ -100,6 +100,7 @@ class LightStateScheduler:
             await asyncio.sleep(sleep_for)
 
     async def _check_once(self) -> None:
+        await self._drain_schedule_change_outbox()
         users = await self._db.get_users_with_notifications()
         if not users:
             return
@@ -113,7 +114,11 @@ class LightStateScheduler:
             self._check_profile(key, profile_users, semaphore)
             for key, profile_users in profiles.items()
         ]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.error("Schedule profile check failed", exc_info=(type(result), result, result.__traceback__))
+        await self._drain_schedule_change_outbox()
 
     async def _check_profile(
         self,
@@ -144,24 +149,27 @@ class LightStateScheduler:
 
             schedule_json = self._schedule_fingerprint(schedule)
             snapshot_json = self._schedule_snapshot(schedule, schedule_json)
-            previous_schedule = await self._db.update_schedule_snapshot(
-                region_slug, queue, subqueue, snapshot_json
+            source_date = schedule.schedule_date
+            observed_date = now.astimezone(KYIV_TZ).date()
+            logical_date = source_date or observed_date
+            previous_schedule, confirmed, candidate_pending = await self._db.observe_schedule(
+                region_slug, queue, subqueue, snapshot_json=snapshot_json,
+                fingerprint=schedule_json, logical_date=logical_date,
+                source_schedule_date=source_date, observed_date=observed_date,
+                recipients=[u.telegram_id for u in users if not is_in_quiet_hours(
+                    now, u.quiet_start, u.quiet_end)],
             )
             if previous_schedule is None:
-                logger.info("Initial schedule saved for %s %s.%s", region_slug, queue, subqueue)
-            else:
-                previous_date, previous_fingerprint = self._snapshot_parts(previous_schedule)
-                if (previous_date is not None and schedule.schedule_date is not None
-                        and previous_date != schedule.schedule_date):
-                    logger.info(
-                        "Schedule date changed for %s %s.%s: %s -> %s; snapshot reset",
-                        region_slug, queue, subqueue, previous_date, schedule.schedule_date,
-                    )
-                elif previous_fingerprint == schedule_json:
-                    logger.info("Schedule unchanged for %s %s.%s", region_slug, queue, subqueue)
-                else:
-                    logger.info("Schedule changed for %s %s.%s", region_slug, queue, subqueue)
-                    await self._notify_schedule_change(users, schedule, previous_fingerprint, now)
+                logger.info("Schedule baseline/candidate stored for %s %s.%s", region_slug, queue, subqueue)
+            elif confirmed:
+                logger.info("Schedule change confirmed for %s %s.%s", region_slug, queue, subqueue)
+
+            if candidate_pending:
+                logger.info(
+                    "Skipping user notifications for unconfirmed schedule candidate %s %s.%s",
+                    region_slug, queue, subqueue,
+                )
+                return
 
             await asyncio.gather(
                 *(self._check_user(user=user, schedule=schedule, state=state, now=now) for user in users),
@@ -173,13 +181,11 @@ class LightStateScheduler:
         # Fingerprint the complete source graph, independently of wall clock or
         # current state. Normalize ordering and duplicate source rows because
         # neither changes the schedule's meaning.
-        data = sorted({
-            (interval.start.strftime("%H:%M"),
-             ("24:00" if interval.ends_at_midnight else interval.end.strftime("%H:%M"))
-             if include_midnight_marker else interval.end.strftime("%H:%M"),
-             interval.state)
-            for interval in schedule.intervals
-        })
+        runs = _canonical_day_intervals(schedule.intervals, default_state=schedule.default_state)
+        end_of_day = "24:00" if include_midnight_marker else "00:00"
+        data = [(f"{start // 60:02d}:{start % 60:02d}",
+                 end_of_day if end == 1440 else f"{end // 60:02d}:{end % 60:02d}", state)
+                for start, end, state in runs]
         return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
     @staticmethod
@@ -260,6 +266,42 @@ class LightStateScheduler:
             schedule.region_slug, schedule.queue, schedule.subqueue,
             len(eligible), len(eligible) - errors, errors,
         )
+
+    async def _drain_schedule_change_outbox(self) -> None:
+        claim = getattr(self._db, "claim_schedule_change_delivery", None)
+        if claim is None:
+            return
+        # Bounded work per scheduler tick; expired leases recover interrupted sends.
+        for _ in range(100):
+            delivery = await claim()
+            if delivery is None:
+                break
+            try:
+                previous = json.loads(delivery.previous_json)
+                current = json.loads(delivery.current_json)
+                prev_intervals = previous.get("intervals", previous) if isinstance(previous, dict) else previous
+                curr_intervals = current.get("intervals", current) if isinstance(current, dict) else current
+                before, after = set(map(tuple, prev_intervals)), set(map(tuple, curr_intervals))
+                added, removed = sorted(after - before), sorted(before - after)
+                lines = ["🔄 Графік змінився!", "", f"⚡ Черга {delivery.queue}.{delivery.subqueue}"]
+                label = lambda item: f"{item[0]}–{item[1]} ({'без світла' if item[2] == 'off' else 'світло є'})"
+                if added:
+                    lines.extend(["", "➕ Додано:"] + [label(item) for item in added])
+                if removed:
+                    lines.extend(["", "➖ Скасовано:"] + [label(item) for item in removed])
+                lines.extend(["", "Перевірте актуальний графік у боті."])
+                await self._bot.send_message(chat_id=delivery.recipient_id, text="\n".join(lines))
+            except Exception as exc:
+                delay = min(3600, 30 * (2 ** min(delivery.attempt_count - 1, 7)))
+                try:
+                    await self._db.finish_schedule_change_delivery(
+                        delivery.event_id, error=f"{type(exc).__name__}: {exc}", retry_seconds=delay
+                    )
+                except Exception:
+                    logger.exception("Could not persist schedule outbox retry id=%s", delivery.event_id)
+                logger.exception("Schedule outbox delivery failed id=%s", delivery.event_id)
+            else:
+                await self._db.finish_schedule_change_delivery(delivery.event_id)
 
     async def _check_user(self, user: User, schedule: DaySchedule, state: str, now: datetime) -> None:
         await self._send_morning_schedule_if_due(user, schedule, state, now)

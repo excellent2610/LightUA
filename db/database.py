@@ -3,16 +3,38 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import datetime
+import uuid
+from datetime import datetime, time
 from pathlib import Path
 from typing import Optional
 
 import asyncpg
 
-from db.models import LastState, User
+from db.models import LastState, ScheduleChangeDelivery, User
 from utils.time_utils import KYIV_TZ
 
 logger = logging.getLogger(__name__)
+
+
+def _snapshot_fingerprint(snapshot_json: str) -> str:
+    import json
+    try:
+        value = json.loads(snapshot_json)
+        intervals = value.get("intervals", value) if isinstance(value, dict) else value
+        from parsing.alerts_parser import ScheduleInterval, _canonical_day_intervals
+        converted = []
+        for start, end, state in intervals:
+            start_time = time.fromisoformat(start)
+            midnight = end in {"24:00", "00:00"} and start_time != time(0)
+            end_time = time(0) if end == "24:00" else time.fromisoformat(end)
+            converted.append(ScheduleInterval(start_time, end_time, state, ends_at_midnight=midnight))
+        runs = _canonical_day_intervals(converted)
+        canonical = [(f"{start // 60:02d}:{start % 60:02d}",
+                      "00:00" if end == 1440 else f"{end // 60:02d}:{end % 60:02d}", state)
+                     for start, end, state in runs]
+        return json.dumps(canonical, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return snapshot_json
 
 USERS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -96,6 +118,26 @@ class Database:
                 "ALTER TABLE last_state ADD COLUMN IF NOT EXISTS last_no_outages_event_key TEXT"
             )
             await connection.execute(SCHEDULE_SNAPSHOT_TABLE_SQL)
+            for statement in (
+                "ALTER TABLE schedule_snapshots ADD COLUMN IF NOT EXISTS logical_date DATE",
+                "ALTER TABLE schedule_snapshots ADD COLUMN IF NOT EXISTS observed_date DATE",
+                "ALTER TABLE schedule_snapshots ADD COLUMN IF NOT EXISTS source_schedule_date DATE",
+                "ALTER TABLE schedule_snapshots ADD COLUMN IF NOT EXISTS candidate_json TEXT",
+                "ALTER TABLE schedule_snapshots ADD COLUMN IF NOT EXISTS candidate_logical_date DATE",
+                "ALTER TABLE schedule_snapshots ADD COLUMN IF NOT EXISTS candidate_observed_date DATE",
+                "ALTER TABLE schedule_snapshots ADD COLUMN IF NOT EXISTS candidate_source_schedule_date DATE",
+                "ALTER TABLE schedule_snapshots ADD COLUMN IF NOT EXISTS candidate_count INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE schedule_snapshots ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()",
+            ):
+                await connection.execute(statement)
+            await connection.execute("""CREATE TABLE IF NOT EXISTS schedule_change_deliveries (
+                id BIGSERIAL PRIMARY KEY, event_key TEXT NOT NULL, recipient_id BIGINT NOT NULL,
+                previous_json TEXT NOT NULL, current_json TEXT NOT NULL, queue INTEGER NOT NULL,
+                subqueue INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','processing','sent','dead')),
+                attempt_count INTEGER NOT NULL DEFAULT 0, available_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                lease_until TIMESTAMP, last_error TEXT, UNIQUE (event_key, recipient_id))""")
+            await connection.execute("CREATE INDEX IF NOT EXISTS schedule_change_delivery_pending_idx ON schedule_change_deliveries(status, available_at, id)")
             await connection.execute(NO_OUTAGE_EVENTS_TABLE_SQL)
             await connection.execute(
                 "ALTER TABLE no_outage_notification_events "
@@ -135,6 +177,107 @@ class Database:
                         schedule_json,
                     )
                     return previous
+
+    async def observe_schedule(
+        self, region_slug: str, queue: int, subqueue: int, *, snapshot_json: str,
+        fingerprint: str, logical_date, observed_date, source_schedule_date, recipients: list[int],
+    ) -> tuple[str | None, bool, bool]:
+        """Persist a candidate; confirm a change on the second successful same-day observation."""
+        pool = self._require_pool()
+        async with self._write_lock:
+            async with pool.acquire() as connection:
+                async with connection.transaction():
+                    key = f"{region_slug}:{queue}.{subqueue}"
+                    await connection.execute("SELECT pg_advisory_xact_lock(hashtext($1))", key)
+                    row = await connection.fetchrow(
+                        "SELECT schedule_json, logical_date, candidate_json, candidate_logical_date, candidate_count "
+                        "FROM schedule_snapshots WHERE region_slug=$1 AND queue=$2 AND subqueue=$3 FOR UPDATE",
+                        region_slug, queue, subqueue,
+                    )
+                    if row is None:
+                        await connection.execute("""INSERT INTO schedule_snapshots
+                            (region_slug,queue,subqueue,schedule_json,logical_date,observed_date,source_schedule_date)
+                            VALUES($1,$2,$3,$4,$5,$6,$7)""", region_slug, queue, subqueue,
+                            snapshot_json, logical_date, observed_date, source_schedule_date)
+                        return None, False, False
+                    previous = row["schedule_json"]
+                    old_date = row["logical_date"]
+                    # Legacy snapshots without an unambiguous date establish a fresh baseline.
+                    if old_date is None or old_date != logical_date:
+                        await connection.execute("""UPDATE schedule_snapshots SET schedule_json=$4,
+                            logical_date=$5,observed_date=$6,source_schedule_date=$7,candidate_json=NULL,
+                            candidate_logical_date=NULL,candidate_observed_date=NULL,
+                            candidate_source_schedule_date=NULL,candidate_count=0,
+                            updated_at=NOW() WHERE region_slug=$1 AND queue=$2 AND subqueue=$3""",
+                            region_slug, queue, subqueue, snapshot_json, logical_date, observed_date, source_schedule_date)
+                        return None, False, False
+                    old_fingerprint = _snapshot_fingerprint(previous)
+                    if fingerprint == old_fingerprint:
+                        await connection.execute("""UPDATE schedule_snapshots SET candidate_json=NULL,
+                            candidate_logical_date=NULL,candidate_observed_date=NULL,
+                            candidate_source_schedule_date=NULL,candidate_count=0,
+                            updated_at=NOW() WHERE region_slug=$1 AND queue=$2 AND subqueue=$3""",
+                            region_slug, queue, subqueue)
+                        return None, False, False
+                    candidate_matches = (
+                        row["candidate_json"] is not None
+                        and row["candidate_logical_date"] == logical_date
+                        and _snapshot_fingerprint(row["candidate_json"]) == fingerprint
+                    )
+                    if not candidate_matches:
+                        await connection.execute("""UPDATE schedule_snapshots SET candidate_json=$4,
+                            candidate_logical_date=$5,candidate_observed_date=$6,
+                            candidate_source_schedule_date=$7,candidate_count=1,
+                            updated_at=NOW() WHERE region_slug=$1 AND queue=$2 AND subqueue=$3""",
+                            region_slug, queue, subqueue, snapshot_json, logical_date, observed_date, source_schedule_date)
+                        return None, False, True
+                    # A new confirmed transition gets a fresh durable event key. The
+                    # snapshot row lock ensures concurrent confirmations create one.
+                    event_key = uuid.uuid4().hex
+                    await connection.execute("""UPDATE schedule_snapshots SET schedule_json=$4,
+                        logical_date=$5,observed_date=$6,source_schedule_date=$7,candidate_json=NULL,
+                        candidate_logical_date=NULL,candidate_observed_date=NULL,
+                        candidate_source_schedule_date=NULL,candidate_count=0,
+                        updated_at=NOW() WHERE region_slug=$1 AND queue=$2 AND subqueue=$3""",
+                        region_slug, queue, subqueue, snapshot_json, logical_date, observed_date, source_schedule_date)
+                    for recipient_id in recipients:
+                        await connection.execute("""INSERT INTO schedule_change_deliveries
+                            (event_key,recipient_id,previous_json,current_json,queue,subqueue)
+                            VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(event_key,recipient_id) DO NOTHING""",
+                            event_key, recipient_id, previous, snapshot_json, queue, subqueue)
+                    return previous, True, False
+
+    async def claim_schedule_change_delivery(self) -> ScheduleChangeDelivery | None:
+        pool = self._require_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute("""UPDATE schedule_change_deliveries SET status='dead',
+                    lease_until=NULL,last_error=COALESCE(last_error,'delivery attempt limit reached')
+                    WHERE attempt_count>=8 AND ((status='pending' AND available_at<=NOW())
+                        OR (status='processing' AND lease_until<NOW()))""")
+                row = await connection.fetchrow("""WITH next AS (
+                    SELECT id FROM schedule_change_deliveries
+                    WHERE ((status='pending' AND available_at<=NOW())
+                       OR (status='processing' AND lease_until<NOW()))
+                      AND attempt_count<8
+                    ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
+                    UPDATE schedule_change_deliveries d SET status='processing',
+                    attempt_count=d.attempt_count+1,lease_until=NOW()+INTERVAL '2 minutes'
+                    FROM next WHERE d.id=next.id
+                    RETURNING d.id,d.recipient_id,d.previous_json,d.current_json,d.queue,d.subqueue,d.attempt_count""")
+                if row is None:
+                    return None
+                return ScheduleChangeDelivery(row["id"], row["recipient_id"], row["previous_json"],
+                    row["current_json"], row["queue"], row["subqueue"], row["attempt_count"])
+
+    async def finish_schedule_change_delivery(self, delivery_id: int, *, error: str | None = None,
+                                              retry_seconds: int = 0) -> None:
+        pool = self._require_pool()
+        async with pool.acquire() as connection:
+            await connection.execute("""UPDATE schedule_change_deliveries SET
+                status=CASE WHEN $2::TEXT IS NULL THEN 'sent' WHEN attempt_count>=8 THEN 'dead' ELSE 'pending' END,
+                available_at=NOW()+($3 * INTERVAL '1 second'), lease_until=NULL,last_error=$2
+                WHERE id=$1""", delivery_id, error[:1000] if error else None, retry_seconds)
 
     async def upsert_user_registration(
         self,

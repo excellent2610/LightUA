@@ -42,6 +42,14 @@ class AlertsParserFixtureTests(unittest.TestCase):
         # The currently published page fixture has no explicit source update time.
         self.assertIsNone(_extract_source_updated_at(soup))
 
+    def test_all_60_flat_groups_in_real_fixture_cover_the_full_day(self) -> None:
+        _soup, text = self._read("kyiv-current.html")
+        for queue in range(1, 61):
+            with self.subTest(queue=queue):
+                intervals = _extract_group_intervals(text, queue, 1)
+                self.assertTrue(intervals)
+                self.assertTrue(_covers_full_day(intervals))
+
     def test_dated_archive_fixture_and_update_timestamp(self) -> None:
         soup, text = self._read("kyiv-2026-10-14.html")
         self.assertTrue(_extract_group_intervals(text, 1, 1))
@@ -57,6 +65,20 @@ class AlertsParserFixtureTests(unittest.TestCase):
         self.assertEqual(_extract_group_intervals(text, 1, 1)[0].start, time(7))
         self.assertEqual(_extract_group_intervals(text, 1, 2)[0].start, time(9))
         self.assertEqual(_extract_group_intervals(text, 2, 1)[0].start, time(11))
+
+    def test_supported_queue_and_subqueue_header_forms_parse_complete_days(self) -> None:
+        day = "00:00 - 06:00 ON\n06:00 - 08:00 OFF\n08:00 - 24:00 ON"
+        cases = (
+            ("Група 1.1", "Група 1.2", 1, 1),
+            ("Черга 1/2", "Черга 1/3", 1, 2),
+            ("Група 1-3", "Група 1-4", 1, 3),
+        )
+        for first_header, second_header, queue, subqueue in cases:
+            with self.subTest(header=first_header):
+                text = f"{first_header}\n{day}\n{second_header}\n{day}"
+                intervals = _extract_group_intervals(text, queue, subqueue)
+                self.assertEqual(len(intervals), 3)
+                self.assertTrue(_covers_full_day(intervals))
 
     def test_24_hour_end_is_retained_as_midnight_boundary(self) -> None:
         interval = _extract_group_intervals("Група 1\n22:00 - 24:00 OFF", 1, 1)[0]

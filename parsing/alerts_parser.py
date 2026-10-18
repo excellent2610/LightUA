@@ -333,24 +333,70 @@ def _time_in_interval(current: time, start: time, end: time, ends_at_midnight: b
 
 
 def _covers_full_day(intervals: list[ScheduleInterval]) -> bool:
-    """Reject partial source responses before they can replace a daily snapshot."""
-    ranges: list[tuple[int, int]] = []
+    """Reject gaps, overlaps, and ambiguous boundaries in source schedules."""
+    try:
+        _canonical_day_intervals(intervals, require_full_day=True)
+    except ValueError:
+        return False
+    return True
+
+
+def _canonical_day_intervals(
+    intervals: list[ScheduleInterval],
+    *,
+    default_state: str = "on",
+    require_full_day: bool = False,
+) -> list[tuple[int, int, str]]:
+    """Return state runs in minutes since midnight, merging equal adjacent runs."""
+    if default_state not in {"on", "off"}:
+        raise ValueError("Invalid default schedule state")
+
+    ranges: list[tuple[int, int, str]] = []
+    unique_intervals = set()
     for interval in intervals:
+        if interval.state not in {"on", "off"}:
+            raise ValueError("Invalid interval state")
         start = interval.start.hour * 60 + interval.start.minute
         if interval.ends_at_midnight:
+            if interval.end != time(0):
+                raise ValueError("Midnight marker requires an end time of 00:00")
             end = 24 * 60
         else:
             end = interval.end.hour * 60 + interval.end.minute
-            if end <= start:
-                return False
-        ranges.append((start, end))
+        if start >= 24 * 60 or end <= start or end > 24 * 60:
+            raise ValueError("Invalid or ambiguous interval bounds")
+        unique_intervals.add((start, end, interval.state))
 
+    ranges.extend(unique_intervals)
+
+    ranges.sort()
+    runs: list[tuple[int, int, str]] = []
     cursor = 0
-    for start, end in sorted(ranges):
-        if start != cursor or end <= start:
-            return False
+
+    def append_run(start: int, end: int, state: str) -> None:
+        if start == end:
+            return
+        if runs and runs[-1][1] == start and runs[-1][2] == state:
+            old_start, _old_end, old_state = runs[-1]
+            runs[-1] = (old_start, end, old_state)
+        else:
+            runs.append((start, end, state))
+
+    for start, end, state in ranges:
+        if start < cursor:
+            raise ValueError("Overlapping schedule intervals")
+        if start > cursor:
+            if require_full_day:
+                raise ValueError("Schedule does not cover the full day")
+            append_run(cursor, start, default_state)
+        append_run(start, end, state)
         cursor = end
-    return cursor == 24 * 60
+
+    if cursor < 24 * 60:
+        if require_full_day:
+            raise ValueError("Schedule does not cover the full day")
+        append_run(cursor, 24 * 60, default_state)
+    return runs
 
 
 def _normalize_text(text: str) -> str:

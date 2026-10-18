@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from bot.scheduler import LightStateScheduler
 from db.database import Database
-from db.models import LastState, User
+from db.models import LastState, ScheduleChangeDelivery, User
 from parsing.alerts_parser import (DaySchedule, ParserError, ScheduleInterval,
     _extract_group_intervals, _extract_schedule_date, _extract_source_updated_at)
 from bs4 import BeautifulSoup
@@ -60,6 +60,8 @@ class FakeDatabase:
         self.final_events: dict[str, dict[str, object]] = {}
         self.notice_lock = asyncio.Lock()
         self.monotonic = 0.0
+        self.deliveries: list[dict[str, object]] = []
+        self.delivery_seq = 0
 
     async def get_users_with_notifications(self) -> list[User]:
         return self.users
@@ -72,6 +74,60 @@ class FakeDatabase:
             previous = self.snapshots.get(key)
             self.snapshots[key] = value
             return previous
+
+    async def observe_schedule(self, region, queue, subqueue, *, snapshot_json, fingerprint,
+                               logical_date, observed_date, source_schedule_date, recipients):
+        import hashlib, json
+        async with self.snapshot_lock:
+            key = (region, queue, subqueue)
+            row = self.snapshots.get(key)
+            if row is None:
+                self.snapshots[key] = json.dumps({"snapshot": snapshot_json, "date": logical_date.isoformat(),
+                    "fingerprint": fingerprint, "candidate": None, "candidate_date": None})
+                return None, False, False
+            data = json.loads(row)
+            previous = data["snapshot"]
+            if data["date"] != logical_date.isoformat():
+                self.snapshots[key] = json.dumps({"snapshot": snapshot_json, "date": logical_date.isoformat(),
+                    "fingerprint": fingerprint, "candidate": None, "candidate_date": None})
+                return None, False, False
+            if data["fingerprint"] == fingerprint:
+                data["candidate"] = None
+                self.snapshots[key] = json.dumps(data)
+                return None, False, False
+            if data["candidate"] != fingerprint or data["candidate_date"] != logical_date.isoformat():
+                data["candidate"] = fingerprint
+                data["candidate_date"] = logical_date.isoformat()
+                self.snapshots[key] = json.dumps(data)
+                return None, False, True
+            event_key = hashlib.sha256(f"{region}|{queue}.{subqueue}|{logical_date}|{data['fingerprint']}|{fingerprint}".encode()).hexdigest()
+            for recipient in recipients:
+                if not any(d["event_key"] == event_key and d["recipient_id"] == recipient for d in self.deliveries):
+                    self.delivery_seq += 1
+                    self.deliveries.append({"id": self.delivery_seq, "event_key": event_key,
+                        "recipient_id": recipient, "previous_json": previous, "current_json": snapshot_json,
+                        "queue": queue, "subqueue": subqueue, "status": "pending", "attempt_count": 0,
+                        "available_at": self.monotonic})
+            self.snapshots[key] = json.dumps({"snapshot": snapshot_json, "date": logical_date.isoformat(),
+                "fingerprint": fingerprint, "candidate": None, "candidate_date": None})
+            return previous, True, False
+
+    async def claim_schedule_change_delivery(self):
+        async with self.notice_lock:
+            for row in self.deliveries:
+                if row["status"] == "pending" and row["available_at"] <= self.monotonic:
+                    row["status"] = "processing"
+                    row["attempt_count"] += 1
+                    return ScheduleChangeDelivery(row["id"], row["recipient_id"], row["previous_json"],
+                        row["current_json"], row["queue"], row["subqueue"], row["attempt_count"])
+        return None
+
+    async def finish_schedule_change_delivery(self, delivery_id, *, error=None, retry_seconds=0):
+        async with self.notice_lock:
+            row = next(d for d in self.deliveries if d["id"] == delivery_id)
+            row["status"] = "pending" if error and row["attempt_count"] < 8 else ("dead" if error else "sent")
+            row["available_at"] = self.monotonic + retry_seconds
+            row["error"] = error
 
     async def get_last_state(self, user_id: int) -> LastState:
         return LastState(user_id, self.states[user_id], self.checked_at[user_id])
@@ -126,6 +182,7 @@ class FakeBot:
         message = str(kwargs.get("text", ""))
         if self.failure is not None and (
             "більше немає запланованих" in message or "☀️ Графік відключень" in message
+            or "🔄 Графік змінився!" in message
         ):
             failure, self.failure = self.failure, None
             raise failure
@@ -248,6 +305,8 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
         target = ("region-a", 2, 1)
         self.parser.schedules[target] = make_schedule(*target, start=1)
 
+        await self._check(self.scheduler)
+        self.assertEqual(self.bot.messages, [])  # First differing full fetch is only a candidate.
         await self._check(self.scheduler)
 
         self.assertEqual([item["chat_id"] for item in self.bot.messages], [11, 12])
@@ -560,10 +619,11 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
     async def test_midnight_marker_does_not_break_existing_snapshot_fingerprint(self) -> None:
         schedule = DaySchedule("region-a", "region-a", 2, 1,
             [ScheduleInterval(time(22), time(0), "off", ends_at_midnight=True)])
-        self.assertEqual(self.scheduler._schedule_fingerprint(schedule), '[["22:00","00:00","off"]]')
+        self.assertEqual(self.scheduler._schedule_fingerprint(schedule),
+                         '[["00:00","22:00","on"],["22:00","00:00","off"]]')
         self.assertEqual(
             self.scheduler._schedule_fingerprint(schedule, include_midnight_marker=True),
-            '[["22:00","24:00","off"]]',
+            '[["00:00","22:00","on"],["22:00","24:00","off"]]',
         )
 
     async def test_schedule_fingerprint_is_stable_across_day_transitions(self) -> None:
@@ -594,6 +654,7 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
                 "bot.scheduler.now_kyiv", return_value=moment
             ):
                 await self.scheduler._check_profile(profile, [user], semaphore)
+                await self.scheduler._drain_schedule_change_outbox()
 
         changes = [m for m in self.bot.messages if "🔄 Графік змінився!" in str(m["text"])]
         self.assertEqual(changes, [])
@@ -624,6 +685,7 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
                 "bot.scheduler.now_kyiv", return_value=moment
             ):
                 await self.scheduler._check_profile(profile, [user], semaphore)
+                await self.scheduler._drain_schedule_change_outbox()
 
         before_eight = datetime(2026, 10, 18, 7, 59, tzinfo=KYIV)
         at_eight = datetime(2026, 10, 18, 8, 0, tzinfo=KYIV)
@@ -639,6 +701,74 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
         await run_at(after_eight)
         changes = [m for m in self.bot.messages if "🔄 Графік змінився!" in str(m["text"])]
         self.assertEqual(changes, [])
+
+    async def test_incomplete_responses_then_recovery_and_real_change(self) -> None:
+        user = self.users[0]
+        profile = (user.region_slug, user.queue, user.subqueue)
+        schedule_date = date(2026, 10, 18)
+
+        def schedule(*, changed: bool = False) -> DaySchedule:
+            intervals = [
+                ScheduleInterval(time(0), time(6), "on"),
+                ScheduleInterval(time(6), time(9 if changed else 8), "off"),
+                ScheduleInterval(time(9 if changed else 8), time(16), "on"),
+                ScheduleInterval(time(16), time(20), "off"),
+                ScheduleInterval(time(20), time(0), "on", ends_at_midnight=True),
+            ]
+            return DaySchedule(
+                user.region_slug, user.region_name, user.queue, user.subqueue,
+                intervals, schedule_date=schedule_date,
+            )
+
+        valid = schedule()
+        self.parser.schedules[profile] = valid
+        semaphore = asyncio.Semaphore(1)
+
+        async def run_at(moment: datetime) -> None:
+            async def direct_to_thread(function, *args):
+                return function(*args)
+
+            with patch("bot.scheduler.asyncio.to_thread", new=direct_to_thread), patch(
+                "bot.scheduler.now_kyiv", return_value=moment
+            ):
+                await self.scheduler._check_profile(profile, [user], semaphore)
+                await self.scheduler._drain_schedule_change_outbox()
+
+        before = datetime(2026, 10, 18, 7, 59, tzinfo=KYIV)
+        await run_at(before)
+        saved_snapshot = self.db.snapshots[profile]
+        saved_user_check = self.db.checked_at[user.telegram_id]
+
+        with self.assertLogs("bot.scheduler", level="WARNING") as warnings:
+            for moment in (
+                datetime(2026, 10, 18, 8, 0, tzinfo=KYIV),
+                datetime(2026, 10, 18, 8, 1, tzinfo=KYIV),
+            ):
+                self.parser.schedules[profile] = ParserError("incomplete source graph missing 06:00-08:00")
+                await run_at(moment)
+                self.assertEqual(self.db.snapshots[profile], saved_snapshot)
+                self.assertEqual(self.db.checked_at[user.telegram_id], saved_user_check)
+                self.assertFalse(any("🔄 Графік змінився!" in str(m["text"]) for m in self.bot.messages))
+                self.assertEqual(self.db.final_events, {})
+        self.assertEqual(sum("Parser error for profile" in line for line in warnings.output), 2)
+
+        self.parser.schedules[profile] = valid
+        await run_at(datetime(2026, 10, 18, 8, 2, tzinfo=KYIV))
+        self.assertEqual(self.db.snapshots[profile], saved_snapshot)
+        self.assertFalse(any("🔄 Графік змінився!" in str(m["text"]) for m in self.bot.messages))
+
+        self.parser.schedules[profile] = schedule(changed=True)
+        await run_at(datetime(2026, 10, 18, 8, 3, tzinfo=KYIV))
+        self.assertFalse(any("🔄 Графік змінився!" in str(m["text"]) for m in self.bot.messages))
+        await run_at(datetime(2026, 10, 18, 8, 4, tzinfo=KYIV))
+        changes = [m for m in self.bot.messages if "🔄 Графік змінився!" in str(m["text"])]
+        self.assertEqual(len(changes), 1)
+        self.assertIn("06:00–08:00 (без світла)", str(changes[0]["text"]))
+        self.assertIn("06:00–09:00 (без світла)", str(changes[0]["text"]))
+
+        await run_at(datetime(2026, 10, 18, 8, 5, tzinfo=KYIV))
+        changes = [m for m in self.bot.messages if "🔄 Графік змінився!" in str(m["text"])]
+        self.assertEqual(len(changes), 1)
 
     async def test_snapshot_date_change_starts_a_new_baseline(self) -> None:
         user = self.users[0]
@@ -669,6 +799,32 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
         changes = [m for m in self.bot.messages if "🔄 Графік змінився!" in str(m["text"])]
         self.assertEqual(changes, [])
 
+    async def test_missing_source_date_uses_kyiv_observation_date(self) -> None:
+        user = self.users[0]
+        profile = (user.region_slug, user.queue, user.subqueue)
+        first = DaySchedule(user.region_slug, user.region_name, user.queue, user.subqueue,
+            [ScheduleInterval(time(0), time(8), "on"),
+             ScheduleInterval(time(8), time(16), "off"),
+             ScheduleInterval(time(16), time(0), "on", ends_at_midnight=True)])
+        next_day_different = DaySchedule(user.region_slug, user.region_name, user.queue, user.subqueue,
+            [ScheduleInterval(time(0), time(7), "on"),
+             ScheduleInterval(time(7), time(16), "off"),
+             ScheduleInterval(time(16), time(0), "on", ends_at_midnight=True)])
+        semaphore = asyncio.Semaphore(1)
+
+        async def run_at(schedule, moment):
+            self.parser.schedules[profile] = schedule
+            async def direct_to_thread(function, *args):
+                return function(*args)
+            with patch("bot.scheduler.asyncio.to_thread", new=direct_to_thread), patch(
+                "bot.scheduler.now_kyiv", return_value=moment
+            ):
+                await self.scheduler._check_profile(profile, [user], semaphore)
+
+        await run_at(first, datetime(2026, 10, 18, 23, 59, tzinfo=KYIV))
+        await run_at(next_day_different, datetime(2026, 10, 19, 0, 1, tzinfo=KYIV))
+        self.assertFalse(any("🔄 Графік змінився!" in str(m["text"]) for m in self.bot.messages))
+
     async def test_fingerprint_detects_real_future_interval_changes(self) -> None:
         original = DaySchedule("region-a", "region-a", 2, 1,
             [ScheduleInterval(time(20), time(22), "off")])
@@ -696,6 +852,132 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
              ScheduleInterval(time(20), time(22), "off")])
         self.assertEqual(self.scheduler._schedule_fingerprint(first),
                          self.scheduler._schedule_fingerprint(reordered))
+
+    async def test_fingerprint_merges_adjacent_same_state_ranges(self) -> None:
+        joined = DaySchedule("region-a", "region-a", 2, 1,
+            [ScheduleInterval(time(20), time(22), "off")])
+        split = DaySchedule("region-a", "region-a", 2, 1,
+            [ScheduleInterval(time(20), time(21), "off"),
+             ScheduleInterval(time(21), time(22), "off")])
+        self.assertEqual(self.scheduler._schedule_fingerprint(joined),
+                         self.scheduler._schedule_fingerprint(split))
+
+    async def test_candidate_revert_and_restart_confirmation(self) -> None:
+        await self._check(self.scheduler)
+        target = ("region-a", 2, 1)
+        self.parser.schedules[target] = make_schedule(*target, start=1)
+        await self._check(self.scheduler)  # Candidate survives process restart.
+        restarted = LightStateScheduler(self.bot, self.db, self.parser)
+        self.parser.schedules[target] = make_schedule(*target, start=0)
+        await self._check(restarted)  # Reversion clears candidate.
+        self.assertFalse(any("🔄 Графік змінився!" in str(m["text"]) for m in self.bot.messages))
+        self.parser.schedules[target] = make_schedule(*target, start=1)
+        await self._check(restarted)
+        self.assertFalse(any("🔄 Графік змінився!" in str(m["text"]) for m in self.bot.messages))
+        await self._check(restarted)
+        changes = [m for m in self.bot.messages if "🔄 Графік змінився!" in str(m["text"])]
+        self.assertEqual(len(changes), 2)  # Two recipients, one logical confirmed event.
+
+    async def test_source_error_does_not_confirm_or_clear_candidate(self) -> None:
+        await self._check(self.scheduler)
+        target = ("region-a", 2, 1)
+        self.parser.schedules[target] = make_schedule(*target, start=1)
+        await self._check(self.scheduler)  # Candidate observation 1.
+        self.parser.schedules[target] = ParserError("temporary source failure")
+        with self.assertLogs("bot.scheduler", level="WARNING"):
+            await self._check(self.scheduler)
+        self.assertFalse(any("🔄 Графік змінився!" in str(m["text"]) for m in self.bot.messages))
+        self.parser.schedules[target] = make_schedule(*target, start=1)
+        await self._check(self.scheduler)  # Next successful match confirms once.
+        changes = [m for m in self.bot.messages if "🔄 Графік змінився!" in str(m["text"])]
+        self.assertEqual(len(changes), 2)
+
+    async def test_unconfirmed_candidate_is_not_used_for_user_state_or_notifications(self) -> None:
+        user = self.users[0]
+        profile = (user.region_slug, user.queue, user.subqueue)
+        now = datetime(2026, 10, 17, 12, 0, tzinfo=KYIV)
+        self.db.states[user.telegram_id] = "on"
+        self.db.checked_at[user.telegram_id] = now.isoformat()
+        confirmed = DaySchedule(user.region_slug, user.region_name, user.queue, user.subqueue,
+            [ScheduleInterval(time(0), time(0), "on", ends_at_midnight=True)],
+            schedule_date=now.date())
+        candidate = DaySchedule(user.region_slug, user.region_name, user.queue, user.subqueue,
+            [ScheduleInterval(time(0), time(12), "on"),
+             ScheduleInterval(time(12), time(14), "off"),
+             ScheduleInterval(time(14), time(0), "on", ends_at_midnight=True)],
+            schedule_date=now.date())
+        semaphore = asyncio.Semaphore(1)
+
+        async def run(schedule):
+            self.parser.schedules[profile] = schedule
+            async def direct_to_thread(function, *args):
+                return function(*args)
+            with patch("bot.scheduler.asyncio.to_thread", new=direct_to_thread), patch(
+                "bot.scheduler.now_kyiv", return_value=now
+            ):
+                await self.scheduler._check_profile(profile, [user], semaphore)
+
+        await run(confirmed)
+        self.bot.messages.clear()
+        before_checked_at = self.db.checked_at[user.telegram_id]
+        await run(candidate)
+        self.assertEqual(self.db.states[user.telegram_id], "on")
+        self.assertEqual(self.db.checked_at[user.telegram_id], before_checked_at)
+        self.assertEqual(self.bot.messages, [])
+
+        # The same graph becomes eligible for user notifications only after confirmation.
+        await run(candidate)
+        self.assertEqual(self.db.states[user.telegram_id], "off")
+        self.assertTrue(any("🔴 ВІДКЛЮЧЕННЯ СВІТЛА" in str(m["text"]) for m in self.bot.messages))
+
+    async def test_schedule_change_outbox_retries_after_process_restart(self) -> None:
+        await self._check(self.scheduler)
+        target = ("region-a", 2, 1)
+        self.parser.schedules[target] = make_schedule(*target, start=1)
+        await self._check(self.scheduler)
+        self.bot.failure = RuntimeError("temporary Telegram failure")
+        await self._check(self.scheduler)  # Confirmation commits event; first attempt fails.
+        pending = [d for d in self.db.deliveries if d["recipient_id"] == 11]
+        self.assertEqual(pending[0]["status"], "pending")
+        self.assertEqual(pending[0]["attempt_count"], 1)
+        restarted = LightStateScheduler(self.bot, self.db, self.parser)
+        self.db.monotonic += 30
+        await restarted._drain_schedule_change_outbox()
+        self.assertEqual(pending[0]["status"], "sent")
+
+    async def test_restart_after_outbox_commit_before_first_send(self) -> None:
+        await self._check(self.scheduler)
+        target = ("region-a", 2, 1)
+        self.parser.schedules[target] = make_schedule(*target, start=1)
+        semaphore = asyncio.Semaphore(1)
+
+        async def observe_without_draining():
+            async def direct_to_thread(function, *args):
+                return function(*args)
+            with patch("bot.scheduler.asyncio.to_thread", new=direct_to_thread), patch(
+                "bot.scheduler.now_kyiv", return_value=NOW
+            ):
+                await self.scheduler._check_profile(target, self.users[:2], semaphore)
+
+        await observe_without_draining()  # Candidate.
+        await observe_without_draining()  # Commits snapshot and recipient rows atomically.
+        self.assertEqual(len(self.db.deliveries), 2)
+        self.assertEqual(self.bot.messages, [])
+        restarted = LightStateScheduler(self.bot, self.db, self.parser)
+        await restarted._drain_schedule_change_outbox()
+        sent = [m for m in self.bot.messages if "🔄 Графік змінився!" in str(m["text"])]
+        self.assertEqual(len(sent), 2)
+        self.assertEqual({m["chat_id"] for m in sent}, {11, 12})
+
+    async def test_repeated_confirmed_change_does_not_create_duplicate_event(self) -> None:
+        await self._check(self.scheduler)
+        target = ("region-a", 2, 1)
+        self.parser.schedules[target] = make_schedule(*target, start=1)
+        await self._check(self.scheduler)
+        await self._check(self.scheduler)
+        count = len(self.db.deliveries)
+        await self._check(self.scheduler)
+        self.assertEqual(len(self.db.deliveries), count)
 
     async def test_repeated_cycle_does_not_repeat_no_outages_notice(self) -> None:
         schedule = DaySchedule(
