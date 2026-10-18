@@ -566,6 +566,80 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
             '[["22:00","24:00","off"]]',
         )
 
+    async def test_schedule_fingerprint_is_stable_across_day_transitions(self) -> None:
+        user = self.users[0]
+        intervals = [
+            ScheduleInterval(time(0), time(2), "on"),
+            ScheduleInterval(time(2), time(3), "off"),
+            ScheduleInterval(time(3), time(10), "on"),
+            ScheduleInterval(time(10), time(12), "off"),
+            ScheduleInterval(time(12), time(14), "on"),
+            ScheduleInterval(time(14), time(16), "off"),
+            ScheduleInterval(time(16), time(20), "on"),
+            ScheduleInterval(time(20), time(22), "off"),
+            ScheduleInterval(time(22), time(0), "on", ends_at_midnight=True),
+        ]
+        schedule = DaySchedule(user.region_slug, user.region_name, user.queue,
+                               user.subqueue, intervals, schedule_date=NOW.date())
+        profile = (user.region_slug, user.queue, user.subqueue)
+        semaphore = asyncio.Semaphore(1)
+        times = ((19, 55), (20, 0), (20, 1), (21, 55), (22, 0), (22, 1))
+
+        async def direct_to_thread(function, *args):
+            return function(*args)
+
+        for hour, minute in times:
+            moment = NOW.replace(hour=hour, minute=minute)
+            with patch("bot.scheduler.asyncio.to_thread", new=direct_to_thread), patch(
+                "bot.scheduler.now_kyiv", return_value=moment
+            ):
+                await self.scheduler._check_profile(profile, [user], semaphore)
+
+        changes = [m for m in self.bot.messages if "🔄 Графік змінився!" in str(m["text"])]
+        self.assertEqual(changes, [])
+
+    async def test_fingerprint_detects_real_future_interval_changes(self) -> None:
+        original = DaySchedule("region-a", "region-a", 2, 1,
+            [ScheduleInterval(time(20), time(22), "off")])
+        shifted = DaySchedule("region-a", "region-a", 2, 1,
+            [ScheduleInterval(time(21), time(23), "off")])
+        added = DaySchedule("region-a", "region-a", 2, 1,
+            [ScheduleInterval(time(20), time(22), "off"),
+             ScheduleInterval(time(23), time(0), "off", ends_at_midnight=True)])
+        removed = DaySchedule("region-a", "region-a", 2, 1,
+            [ScheduleInterval(time(20), time(22), "off")])
+
+        original_fingerprint = self.scheduler._schedule_fingerprint(original)
+        self.assertNotEqual(original_fingerprint, self.scheduler._schedule_fingerprint(shifted))
+        self.assertNotEqual(original_fingerprint, self.scheduler._schedule_fingerprint(added))
+        self.assertNotEqual(self.scheduler._schedule_fingerprint(added),
+                            self.scheduler._schedule_fingerprint(removed))
+
+    async def test_fingerprint_ignores_interval_order_and_duplicate_rows(self) -> None:
+        first = DaySchedule("region-a", "region-a", 2, 1,
+            [ScheduleInterval(time(20), time(22), "off"),
+             ScheduleInterval(time(22), time(0), "on", ends_at_midnight=True)])
+        reordered = DaySchedule("region-a", "region-a", 2, 1,
+            [ScheduleInterval(time(22), time(0), "on", ends_at_midnight=True),
+             ScheduleInterval(time(20), time(22), "off"),
+             ScheduleInterval(time(20), time(22), "off")])
+        self.assertEqual(self.scheduler._schedule_fingerprint(first),
+                         self.scheduler._schedule_fingerprint(reordered))
+
+    async def test_repeated_cycle_does_not_repeat_no_outages_notice(self) -> None:
+        schedule = DaySchedule(
+            "region-a", "region-a", 2, 1,
+            [ScheduleInterval(time(8), time(10), "off")],
+            schedule_date=NOW.date(), fetched_at=NOW - timedelta(minutes=10),
+            source_updated_at=NOW - timedelta(minutes=10),
+        )
+
+        await self._run_end_of_day(schedule)
+        await self._run_end_of_day(schedule)
+
+        finals = [m for m in self.bot.messages if "більше немає запланованих" in str(m["text"])]
+        self.assertEqual(len(finals), 1)
+
     async def test_morning_schedule_is_sent_at_0700(self) -> None:
         now = datetime(2026, 10, 17, 7, 0, tzinfo=KYIV)
         user = self.users[0]

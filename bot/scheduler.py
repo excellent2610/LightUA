@@ -161,13 +161,16 @@ class LightStateScheduler:
 
     @staticmethod
     def _schedule_fingerprint(schedule: DaySchedule, *, include_midnight_marker: bool = False) -> str:
-        data = [
-            [interval.start.strftime("%H:%M"),
+        # Fingerprint the complete source graph, independently of wall clock or
+        # current state. Normalize ordering and duplicate source rows because
+        # neither changes the schedule's meaning.
+        data = sorted({
+            (interval.start.strftime("%H:%M"),
              ("24:00" if interval.ends_at_midnight else interval.end.strftime("%H:%M"))
              if include_midnight_marker else interval.end.strftime("%H:%M"),
-             interval.state]
+             interval.state)
             for interval in schedule.intervals
-        ]
+        })
         return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
     async def _notify_schedule_change(
