@@ -143,6 +143,9 @@ class AlertsParser:
                 raise ScheduleNotFoundError("Графік не опубліковано")
             raise ScheduleNotFoundError("Не знайдено інтервали для вибраної черги")
 
+        if intervals and not _covers_full_day(intervals):
+            raise ScheduleNotFoundError("Отримано неповний графік для вибраної черги")
+
         region_name = self._extract_region_name(source_soup, region_slug)
         schedule_date = _extract_schedule_date(source_soup, source_url)
         return DaySchedule(
@@ -327,6 +330,27 @@ def _time_in_interval(current: time, start: time, end: time, ends_at_midnight: b
     if start < end:
         return start <= current < end
     return current >= start or current < end
+
+
+def _covers_full_day(intervals: list[ScheduleInterval]) -> bool:
+    """Reject partial source responses before they can replace a daily snapshot."""
+    ranges: list[tuple[int, int]] = []
+    for interval in intervals:
+        start = interval.start.hour * 60 + interval.start.minute
+        if interval.ends_at_midnight:
+            end = 24 * 60
+        else:
+            end = interval.end.hour * 60 + interval.end.minute
+            if end <= start:
+                return False
+        ranges.append((start, end))
+
+    cursor = 0
+    for start, end in sorted(ranges):
+        if start != cursor or end <= start:
+            return False
+        cursor = end
+    return cursor == 24 * 60
 
 
 def _normalize_text(text: str) -> str:

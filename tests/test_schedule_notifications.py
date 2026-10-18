@@ -598,6 +598,77 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
         changes = [m for m in self.bot.messages if "🔄 Графік змінився!" in str(m["text"])]
         self.assertEqual(changes, [])
 
+    async def test_incomplete_source_cycle_does_not_replace_same_day_snapshot(self) -> None:
+        user = self.users[0]
+        profile = (user.region_slug, user.queue, user.subqueue)
+        schedule = DaySchedule(
+            user.region_slug, user.region_name, user.queue, user.subqueue,
+            [
+                ScheduleInterval(time(0), time(6), "on"),
+                ScheduleInterval(time(6), time(8), "off"),
+                ScheduleInterval(time(8), time(16), "on"),
+                ScheduleInterval(time(16), time(20), "off"),
+                ScheduleInterval(time(20), time(0), "on", ends_at_midnight=True),
+            ],
+            schedule_date=date(2026, 10, 18),
+            fetched_at=NOW,
+        )
+        self.parser.schedules[profile] = schedule
+        semaphore = asyncio.Semaphore(1)
+
+        async def run_at(moment: datetime) -> None:
+            async def direct_to_thread(function, *args):
+                return function(*args)
+
+            with patch("bot.scheduler.asyncio.to_thread", new=direct_to_thread), patch(
+                "bot.scheduler.now_kyiv", return_value=moment
+            ):
+                await self.scheduler._check_profile(profile, [user], semaphore)
+
+        before_eight = datetime(2026, 10, 18, 7, 59, tzinfo=KYIV)
+        at_eight = datetime(2026, 10, 18, 8, 0, tzinfo=KYIV)
+        after_eight = datetime(2026, 10, 18, 8, 1, tzinfo=KYIV)
+        await run_at(before_eight)
+        stored = self.db.snapshots[profile]
+
+        self.parser.schedules[profile] = ParserError("incomplete source graph")
+        await run_at(at_eight)
+        self.assertEqual(self.db.snapshots[profile], stored)
+
+        self.parser.schedules[profile] = schedule
+        await run_at(after_eight)
+        changes = [m for m in self.bot.messages if "🔄 Графік змінився!" in str(m["text"])]
+        self.assertEqual(changes, [])
+
+    async def test_snapshot_date_change_starts_a_new_baseline(self) -> None:
+        user = self.users[0]
+        profile = (user.region_slug, user.queue, user.subqueue)
+        first = DaySchedule(user.region_slug, user.region_name, user.queue, user.subqueue,
+            [ScheduleInterval(time(0), time(8), "on"),
+             ScheduleInterval(time(8), time(16), "off"),
+             ScheduleInterval(time(16), time(0), "on", ends_at_midnight=True)],
+            schedule_date=date(2026, 10, 17))
+        next_day = DaySchedule(user.region_slug, user.region_name, user.queue, user.subqueue,
+            [ScheduleInterval(time(0), time(7), "on"),
+             ScheduleInterval(time(7), time(16), "off"),
+             ScheduleInterval(time(16), time(0), "on", ends_at_midnight=True)],
+            schedule_date=date(2026, 10, 18))
+        self.parser.schedules[profile] = first
+        semaphore = asyncio.Semaphore(1)
+
+        async def direct_to_thread(function, *args):
+            return function(*args)
+
+        with patch("bot.scheduler.asyncio.to_thread", new=direct_to_thread), patch(
+            "bot.scheduler.now_kyiv", return_value=NOW
+        ):
+            await self.scheduler._check_profile(profile, [user], semaphore)
+            self.parser.schedules[profile] = next_day
+            await self.scheduler._check_profile(profile, [user], semaphore)
+
+        changes = [m for m in self.bot.messages if "🔄 Графік змінився!" in str(m["text"])]
+        self.assertEqual(changes, [])
+
     async def test_fingerprint_detects_real_future_interval_changes(self) -> None:
         original = DaySchedule("region-a", "region-a", 2, 1,
             [ScheduleInterval(time(20), time(22), "off")])

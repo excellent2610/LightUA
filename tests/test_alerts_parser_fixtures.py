@@ -10,9 +10,11 @@ from parsing.alerts_parser import (
     AlertsParser,
     ScheduleNotFoundError,
     _collect_target_blocks,
+    _covers_full_day,
     _extract_group_intervals,
     _extract_schedule_date,
     _extract_source_updated_at,
+    ScheduleInterval,
 )
 
 
@@ -61,6 +63,30 @@ class AlertsParserFixtureTests(unittest.TestCase):
         self.assertEqual(interval.start, time(22))
         self.assertEqual(interval.end, time(0))
         self.assertTrue(interval.ends_at_midnight)
+
+    def test_incomplete_source_day_is_rejected_before_it_can_be_snapshotted(self) -> None:
+        full_day = [
+            ScheduleInterval(time(0), time(6), "on"),
+            ScheduleInterval(time(6), time(8), "off"),
+            ScheduleInterval(time(8), time(16), "on"),
+            ScheduleInterval(time(16), time(20), "off"),
+            ScheduleInterval(time(20), time(0), "on", ends_at_midnight=True),
+        ]
+        missing_passed_interval = [item for item in full_day if item.start != time(6)]
+        self.assertTrue(_covers_full_day(full_day))
+        self.assertFalse(_covers_full_day(missing_passed_interval))
+
+        parser = AlertsParser()
+        parser._fetch_url = lambda _url: (
+            "<title>Графік 18.10.2026</title>"
+            "<b>Група 4.2</b>"
+            "<div>00:00 - 06:00 ON</div>"
+            "<div>08:00 - 16:00 ON</div>"
+            "<div>16:00 - 20:00 OFF</div>"
+            "<div>20:00 - 24:00 ON</div>"
+        )
+        with self.assertRaises(ScheduleNotFoundError):
+            parser.get_schedule("cherkasy", 4, 2)
 
     def test_invalid_or_missing_dates_are_not_invented(self) -> None:
         soup = BeautifulSoup("<title>Графік</title><h1>Графік, 31.02.2026</h1>", "html.parser")

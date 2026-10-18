@@ -143,16 +143,25 @@ class LightStateScheduler:
                 return
 
             schedule_json = self._schedule_fingerprint(schedule)
+            snapshot_json = self._schedule_snapshot(schedule, schedule_json)
             previous_schedule = await self._db.update_schedule_snapshot(
-                region_slug, queue, subqueue, schedule_json
+                region_slug, queue, subqueue, snapshot_json
             )
             if previous_schedule is None:
                 logger.info("Initial schedule saved for %s %s.%s", region_slug, queue, subqueue)
-            elif previous_schedule == schedule_json:
-                logger.info("Schedule unchanged for %s %s.%s", region_slug, queue, subqueue)
             else:
-                logger.info("Schedule changed for %s %s.%s", region_slug, queue, subqueue)
-                await self._notify_schedule_change(users, schedule, previous_schedule, now)
+                previous_date, previous_fingerprint = self._snapshot_parts(previous_schedule)
+                if (previous_date is not None and schedule.schedule_date is not None
+                        and previous_date != schedule.schedule_date):
+                    logger.info(
+                        "Schedule date changed for %s %s.%s: %s -> %s; snapshot reset",
+                        region_slug, queue, subqueue, previous_date, schedule.schedule_date,
+                    )
+                elif previous_fingerprint == schedule_json:
+                    logger.info("Schedule unchanged for %s %s.%s", region_slug, queue, subqueue)
+                else:
+                    logger.info("Schedule changed for %s %s.%s", region_slug, queue, subqueue)
+                    await self._notify_schedule_change(users, schedule, previous_fingerprint, now)
 
             await asyncio.gather(
                 *(self._check_user(user=user, schedule=schedule, state=state, now=now) for user in users),
@@ -172,6 +181,37 @@ class LightStateScheduler:
             for interval in schedule.intervals
         })
         return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _schedule_snapshot(schedule: DaySchedule, fingerprint: str) -> str:
+        """Persist the full canonical graph together with its source date."""
+        return json.dumps(
+            {"schedule_date": schedule.schedule_date.isoformat() if schedule.schedule_date else None,
+             "intervals": json.loads(fingerprint)},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _snapshot_parts(snapshot_json: str) -> tuple[date | None, str]:
+        """Read current snapshots and legacy interval-list snapshots."""
+        try:
+            value = json.loads(snapshot_json)
+        except (TypeError, json.JSONDecodeError):
+            return None, snapshot_json
+
+        if isinstance(value, dict) and "intervals" in value:
+            raw_date = value.get("schedule_date")
+            try:
+                schedule_date = date.fromisoformat(raw_date) if raw_date else None
+            except (TypeError, ValueError):
+                schedule_date = None
+            intervals = value["intervals"]
+        else:
+            # Snapshots created before schedule dates were included were lists.
+            schedule_date = None
+            intervals = value
+        return schedule_date, json.dumps(intervals, ensure_ascii=False, separators=(",", ":"))
 
     async def _notify_schedule_change(
         self, users: list[User], schedule: DaySchedule, previous_json: str, now: datetime
