@@ -372,15 +372,27 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
         # Both concurrent runs read the same profiles; the update is claimed only once.
         self.assertEqual(len(self.bot.messages), 2)
 
-    async def test_existing_light_state_notification_still_works(self) -> None:
+    async def test_light_state_change_does_not_send_immediate_notification(self) -> None:
         self.db.states[11] = "on"
         schedule = make_schedule("region-a", 2, 1)
 
         with patch("bot.scheduler.now_kyiv", return_value=NOW):
             await self.scheduler._check_user(self.users[0], schedule, "off", NOW)
 
-        self.assertEqual(len(self.bot.messages), 1)
-        self.assertIn("ВІДКЛЮЧЕННЯ СВІТЛА", str(self.bot.messages[0]["text"]))
+        self.assertEqual(self.bot.messages, [])
+
+    async def test_five_minute_warning_is_not_sent_before_light_returns(self) -> None:
+        user = self.users[0]
+        schedule = DaySchedule(
+            user.region_slug, user.region_name, user.queue, user.subqueue,
+            [ScheduleInterval(time(10), time(11), "off")],
+            schedule_date=date(2026, 10, 18),
+        )
+        moment = datetime(2026, 10, 18, 10, 55, 4, tzinfo=KYIV)
+
+        await self.scheduler._check_user(user, schedule, "off", moment)
+
+        self.assertEqual(self.bot.messages, [])
 
     async def test_existing_five_minute_warning_still_works(self) -> None:
         schedule = DaySchedule(
@@ -1012,7 +1024,7 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
         # The same graph becomes eligible for user notifications only after confirmation.
         await run(candidate)
         self.assertEqual(self.db.states[user.telegram_id], "off")
-        self.assertTrue(any("🔴 ВІДКЛЮЧЕННЯ СВІТЛА" in str(m["text"]) for m in self.bot.messages))
+        self.assertEqual(self.bot.messages, [])
 
     async def test_schedule_change_outbox_retries_after_process_restart(self) -> None:
         await self._check(self.scheduler)

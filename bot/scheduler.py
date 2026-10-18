@@ -13,7 +13,6 @@ from aiogram import Bot
 from db.database import Database
 from db.models import User
 from parsing.alerts_parser import AlertsParser, DaySchedule, ParserError, _canonical_day_intervals
-from utils.formatting import format_light_change_message
 from utils.time_utils import KYIV_TZ, is_in_quiet_hours, now_kyiv, parse_hhmm
 
 logger = logging.getLogger(__name__)
@@ -54,7 +53,7 @@ class LightStateScheduler:
         *,
         full_graph_text: str,
         now: datetime,
-    ) -> tuple[datetime, str, str] | None:
+    ) -> tuple[datetime, str] | None:
         ranges: list[tuple[str, str, str]] = []
         for raw_line in full_graph_text.splitlines():
             line = raw_line.strip()
@@ -66,13 +65,14 @@ class LightStateScheduler:
             emoji, start, end = match.groups()
             ranges.append((emoji, start, end))
 
-        candidates: list[tuple[datetime, str, str]] = []
+        candidates: list[tuple[datetime, str]] = []
         for emoji, start, end in ranges:
+            if emoji != "🔴":
+                continue
             start_dt = self._time_on_day(now, start)
             if start_dt <= now:
                 continue
-            event_type = "ВІДКЛЮЧЕННЯ" if emoji == "🔴" else "СВІТЛО Є"
-            candidates.append((start_dt, event_type, f"{start} – {end}"))
+            candidates.append((start_dt, f"{start} – {end}"))
 
         if not candidates:
             return None
@@ -318,7 +318,7 @@ class LightStateScheduler:
             full_graph_text = format_graph_message(schedule=schedule, current_state=state, now=now)
             next_change = self._next_change_from_graph(full_graph_text=full_graph_text, now=now)
             if next_change is not None and not is_in_quiet_hours(now, user.quiet_start, user.quiet_end):
-                start_dt, event_type, interval_text = next_change
+                start_dt, interval_text = next_change
                 warning_dt = start_dt - timedelta(minutes=5)
                 warning_lag_seconds = (now - warning_dt).total_seconds()
                 # Send only near the planned warning timestamp, not any time later
@@ -327,25 +327,16 @@ class LightStateScheduler:
                 # short catch-up window so a due warning is not lost to that
                 # request latency, while never sending it minutes late.
                 if 0 <= warning_lag_seconds <= max(20, self._interval_seconds):
-                    event_key = f"{start_dt.isoformat()}|{event_type}|{interval_text}"
+                    event_key = f"{start_dt.isoformat()}|{interval_text}"
                     last_event_key = self._last_warning_event_key_by_user.get(user.telegram_id)
                     if last_event_key != event_key:
-                        if event_type == "ВІДКЛЮЧЕННЯ":
-                            warning_text = (
-                                "⚠️ За 5 хвилин вимкнуть світло\n\n"
-                                f"📍 {user.region_name} · Черга {user.queue}.{user.subqueue}\n\n"
-                                f"🕒 Початок: {interval_text.split(' – ', 1)[0]}\n"
-                                f"🕓 Орієнтовне завершення: {interval_text.split(' – ', 1)[1]}\n\n"
-                                "За графіком alerts.org.ua."
-                            )
-                        else:
-                            warning_text = (
-                                "💡 За 5 хвилин має з'явитися світло\n\n"
-                                f"📍 {user.region_name} · Черга {user.queue}.{user.subqueue}\n\n"
-                                f"🕒 Очікуваний час: {interval_text.split(' – ', 1)[0]}\n"
-                                f"🕓 Інтервал відключення: {interval_text}\n\n"
-                                "За графіком alerts.org.ua."
-                            )
+                        warning_text = (
+                            "⚠️ За 5 хвилин вимкнуть світло\n\n"
+                            f"📍 {user.region_name} · Черга {user.queue}.{user.subqueue}\n\n"
+                            f"🕒 Початок: {interval_text.split(' – ', 1)[0]}\n"
+                            f"🕓 Орієнтовне завершення: {interval_text.split(' – ', 1)[1]}\n\n"
+                            "За графіком alerts.org.ua."
+                        )
                         await self._bot.send_message(chat_id=user.telegram_id, text=warning_text)
                         self._last_warning_event_key_by_user[user.telegram_id] = event_key
         except Exception:
@@ -360,20 +351,6 @@ class LightStateScheduler:
 
         if previous is None:
             return
-        if previous.last_light_state != state and not is_in_quiet_hours(
-            now, user.quiet_start, user.quiet_end
-        ):
-            text = format_light_change_message(
-                state=state,
-                region_name=user.region_name,
-                queue=user.queue,
-                subqueue=user.subqueue,
-            )
-            try:
-                await self._bot.send_message(chat_id=user.telegram_id, text=text)
-            except Exception:
-                logger.exception("Failed to send notification to user=%s", user.telegram_id)
-
         # Retry a previously confirmed Telegram failure on a later cycle. The
         # event store suppresses sent, in-flight, and ambiguous outcomes.
         if state == "on" and not is_in_quiet_hours(now, user.quiet_start, user.quiet_end):
