@@ -406,7 +406,147 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
             await self.scheduler._check_user(self.users[0], schedule, "on", NOW)
 
         self.assertEqual(len(self.bot.messages), 1)
-        self.assertIn("За 5 хвилин вимкнуть світло", str(self.bot.messages[0]["text"]))
+        warning = str(self.bot.messages[0]["text"])
+        self.assertIn("За 5 хвилин вимкнуть світло", warning)
+        self.assertIn("🕒 Очікуваний час: 12:05", warning)
+        self.assertIn("🕓 Світла не буде з 12:05 до 13:00", warning)
+        self.assertNotIn("Початок:", warning)
+        self.assertNotIn("Орієнтовне завершення:", warning)
+
+    async def test_restoration_warning_uses_green_interval_and_dynamic_profile(self) -> None:
+        user = self.users[0]
+        user.region_name = "Черкаська область"
+        user.queue, user.subqueue = 4, 2
+        schedule = DaySchedule(
+            user.region_slug, user.region_name, user.queue, user.subqueue,
+            [
+                ScheduleInterval(time(0), time(12), "off"),
+                ScheduleInterval(time(12), time(20), "on"),
+                ScheduleInterval(time(20), time(0), "off", ends_at_midnight=True),
+            ],
+            schedule_date=NOW.date(),
+            source_updated_at=NOW - timedelta(minutes=10),
+        )
+        now = NOW.replace(hour=11, minute=55, second=4)
+
+        await self.scheduler._check_user(user, schedule, "off", now)
+
+        self.assertEqual(len(self.bot.messages), 1)
+        self.assertEqual(self.bot.messages[0]["chat_id"], user.telegram_id)
+        self.assertEqual(
+            self.bot.messages[0]["text"],
+            "💡 За 5 хвилин має з'явитися світло\n\n"
+            "📍 Черкаська область · Черга 4.2\n\n"
+            "🕒 Очікуваний час: 12:00\n"
+            "🕓 Світло буде з 12:00 до 20:00\n\n"
+            "За графіком alerts.org.ua.",
+        )
+
+    async def test_warning_deduplication_is_separate_for_outage_and_restoration(self) -> None:
+        user = self.users[0]
+        schedule = DaySchedule(
+            user.region_slug, user.region_name, user.queue, user.subqueue,
+            [
+                ScheduleInterval(time(0), time(10), "on"),
+                ScheduleInterval(time(10), time(12), "off"),
+                ScheduleInterval(time(12), time(20), "on"),
+                ScheduleInterval(time(20), time(0), "off", ends_at_midnight=True),
+            ],
+            schedule_date=NOW.date(),
+        )
+
+        await self.scheduler._check_user(user, schedule, "on", NOW.replace(hour=9, minute=55, second=4))
+        await self.scheduler._check_user(user, schedule, "off", NOW.replace(hour=11, minute=55, second=4))
+        await self.scheduler._check_user(user, schedule, "off", NOW.replace(hour=11, minute=55, second=5))
+
+        self.assertEqual(len(self.bot.messages), 2)
+        self.assertIn("⚠️ За 5 хвилин вимкнуть світло", str(self.bot.messages[0]["text"]))
+        self.assertIn("💡 За 5 хвилин має з'явитися світло", str(self.bot.messages[1]["text"]))
+        self.assertEqual(len(self.scheduler._last_warning_event_key_by_user), 1)
+        event_key = self.scheduler._last_warning_event_key_by_user[user.telegram_id]
+        self.assertTrue(event_key.startswith("restoration|"))
+
+    async def test_restoration_warning_obeys_due_window_and_quiet_hours(self) -> None:
+        user = self.users[0]
+        schedule = DaySchedule(
+            user.region_slug, user.region_name, user.queue, user.subqueue,
+            [ScheduleInterval(time(0), time(12), "off"), ScheduleInterval(time(12), time(0), "on", ends_at_midnight=True)],
+            schedule_date=NOW.date(),
+        )
+        await self.scheduler._check_user(user, schedule, "off", NOW.replace(hour=11, minute=54, second=58))
+        self.assertEqual(self.bot.messages, [])
+
+        user.quiet_start, user.quiet_end = "11:00", "12:00"
+        await self.scheduler._check_user(user, schedule, "off", NOW.replace(hour=11, minute=55, second=4))
+        self.assertEqual(self.bot.messages, [])
+
+    async def test_restoration_warning_after_midnight_uses_explicit_wrapped_interval(self) -> None:
+        user = self.users[0]
+        schedule = DaySchedule(
+            user.region_slug, user.region_name, user.queue, user.subqueue,
+            [
+                ScheduleInterval(time(2), time(22), "on"),
+                ScheduleInterval(time(22), time(2), "off"),
+            ],
+            schedule_date=NOW.date(),
+        )
+        await self.scheduler._check_user(
+            user, schedule, "on", NOW.replace(hour=21, minute=55, second=4)
+        )
+        now = (NOW + timedelta(days=1)).replace(hour=1, minute=55, second=4)
+        await self.scheduler._check_user(user, schedule, "off", now)
+
+        self.assertEqual(len(self.bot.messages), 2)
+        self.assertIn("🕒 Очікуваний час: 22:00", str(self.bot.messages[0]["text"]))
+        self.assertIn("🕓 Світла не буде з 22:00 до 02:00", str(self.bot.messages[0]["text"]))
+        self.assertIn("🕒 Очікуваний час: 02:00", str(self.bot.messages[1]["text"]))
+        self.assertIn("🕓 Світло буде з 02:00 до 22:00", str(self.bot.messages[1]["text"]))
+        event_key = self.scheduler._last_warning_event_key_by_user[user.telegram_id]
+        self.assertIn("2026-10-18T02:00:00", event_key)
+
+    async def test_restoration_at_midnight_uses_the_graph_date(self) -> None:
+        user = self.users[0]
+        next_day = NOW.date() + timedelta(days=1)
+        schedule = DaySchedule(
+            user.region_slug, user.region_name, user.queue, user.subqueue,
+            [
+                ScheduleInterval(time(0), time(6), "on"),
+                ScheduleInterval(time(6), time(0), "off", ends_at_midnight=True),
+            ],
+            schedule_date=next_day,
+        )
+        now = NOW.replace(hour=23, minute=55, second=4)
+
+        await self.scheduler._check_user(user, schedule, "off", now)
+
+        self.assertEqual(len(self.bot.messages), 1)
+        self.assertIn("🕒 Очікуваний час: 00:00", str(self.bot.messages[0]["text"]))
+        event_key = self.scheduler._last_warning_event_key_by_user[user.telegram_id]
+        self.assertIn("2026-10-18T00:00:00", event_key)
+
+    async def test_missing_stale_or_invalid_schedule_does_not_warn(self) -> None:
+        user = self.users[0]
+        now = NOW.replace(hour=11, minute=55, second=4)
+        green_schedule = DaySchedule(
+            user.region_slug, user.region_name, user.queue, user.subqueue,
+            [ScheduleInterval(time(12), time(20), "on")],
+            schedule_date=NOW.date(),
+            source_updated_at=NOW - timedelta(days=2),
+        )
+        await self.scheduler._check_user(user, green_schedule, "off", now)
+        self.assertEqual(self.bot.messages, [])
+
+        malformed = "🔴 24:00–25:00"
+        self.assertIsNone(self.scheduler._next_change_from_graph(
+            full_graph_text=malformed, now=now, schedule_date=NOW.date(),
+        ))
+
+        missing_date = DaySchedule(
+            user.region_slug, user.region_name, user.queue, user.subqueue,
+            [ScheduleInterval(time(12), time(20), "on")],
+        )
+        await self.scheduler._check_user(user, missing_date, "off", now)
+        self.assertEqual(self.bot.messages, [])
 
     async def test_warning_due_time_catches_up_without_duplicate(self) -> None:
         user = self.users[0]
@@ -1001,7 +1141,7 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
     async def test_unconfirmed_candidate_is_not_used_for_user_state_or_notifications(self) -> None:
         user = self.users[0]
         profile = (user.region_slug, user.queue, user.subqueue)
-        now = datetime(2026, 10, 17, 12, 0, tzinfo=KYIV)
+        now = datetime(2026, 10, 17, 11, 55, 4, tzinfo=KYIV)
         self.db.states[user.telegram_id] = "on"
         self.db.checked_at[user.telegram_id] = now.isoformat()
         confirmed = DaySchedule(user.region_slug, user.region_name, user.queue, user.subqueue,
@@ -1033,8 +1173,9 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
 
         # The same graph becomes eligible for user notifications only after confirmation.
         await run(candidate)
-        self.assertEqual(self.db.states[user.telegram_id], "off")
-        self.assertEqual(self.bot.messages, [])
+        self.assertEqual(self.db.states[user.telegram_id], "on")
+        self.assertEqual(len(self.bot.messages), 1)
+        self.assertIn("За 5 хвилин вимкнуть світло", str(self.bot.messages[0]["text"]))
 
     async def test_schedule_change_outbox_retries_after_process_restart(self) -> None:
         await self._check(self.scheduler)

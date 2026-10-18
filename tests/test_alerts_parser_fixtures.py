@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import unittest
-from datetime import time
+from datetime import datetime, time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 
@@ -11,9 +12,11 @@ from parsing.alerts_parser import (
     ScheduleNotFoundError,
     _collect_target_blocks,
     _covers_full_day,
+    _canonical_day_intervals,
     _extract_group_intervals,
     _extract_schedule_date,
     _extract_source_updated_at,
+    DaySchedule,
     ScheduleInterval,
 )
 
@@ -85,6 +88,55 @@ class AlertsParserFixtureTests(unittest.TestCase):
         self.assertEqual(interval.start, time(22))
         self.assertEqual(interval.end, time(0))
         self.assertTrue(interval.ends_at_midnight)
+
+    def test_wrapped_interval_is_split_for_full_day_validation_and_state_lookup(self) -> None:
+        intervals = _extract_group_intervals(
+            "Група 1\n22:00 - 02:00 OFF\n02:00 - 22:00 ON", 1, 1
+        )
+
+        self.assertEqual(len(intervals), 2)
+        self.assertEqual(intervals[0].start, time(2))
+        self.assertEqual(intervals[1].start, time(22))
+        self.assertTrue(_covers_full_day(intervals))
+        self.assertEqual(
+            _canonical_day_intervals(intervals),
+            [(0, 120, "off"), (120, 1320, "on"), (1320, 1440, "off")],
+        )
+        schedule = DaySchedule("kyiv", "Київ", 1, 1, intervals)
+        self.assertEqual(schedule.state_at(datetime(2026, 10, 17, 23, 0, tzinfo=ZoneInfo("Europe/Kyiv"))), "off")
+        self.assertEqual(schedule.state_at(datetime(2026, 10, 18, 1, 0, tzinfo=ZoneInfo("Europe/Kyiv"))), "off")
+        self.assertEqual(schedule.state_at(datetime(2026, 10, 18, 2, 0, tzinfo=ZoneInfo("Europe/Kyiv"))), "on")
+
+        parser = AlertsParser()
+        parser._fetch_url = lambda _url: (
+            "<title>Графік 17.10.2026</title><b>Група 1</b>"
+            "<div>22:00 - 02:00 OFF</div><div>02:00 - 22:00 ON</div>"
+        )
+        parsed_schedule = parser.get_schedule("kyiv", 1, 1)
+        self.assertTrue(_covers_full_day(parsed_schedule.intervals))
+
+    def test_wrapped_intervals_do_not_make_incomplete_or_ambiguous_days_valid(self) -> None:
+        incomplete = [ScheduleInterval(time(22), time(2), "off")]
+        overlapping = [
+            ScheduleInterval(time(22), time(2), "off"),
+            ScheduleInterval(time(0), time(3), "on"),
+            ScheduleInterval(time(2), time(22), "on"),
+        ]
+        ambiguous = [
+            ScheduleInterval(time(0), time(6), "on"),
+            ScheduleInterval(time(6), time(6), "off"),
+            ScheduleInterval(time(6), time(0), "on", ends_at_midnight=True),
+        ]
+
+        self.assertFalse(_covers_full_day(incomplete))
+        self.assertFalse(_covers_full_day(overlapping))
+        self.assertFalse(_covers_full_day(ambiguous))
+        self.assertFalse(_covers_full_day([]))
+
+        invalid_start = _extract_group_intervals(
+            "Група 1\n24:00 - 02:00 OFF\n02:00 - 24:00 ON", 1, 1
+        )
+        self.assertFalse(_covers_full_day(invalid_start))
 
     def test_incomplete_source_day_is_rejected_before_it_can_be_snapshotted(self) -> None:
         full_day = [

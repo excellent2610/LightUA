@@ -13,7 +13,9 @@ from utils.time_utils import KYIV_TZ, now_kyiv
 
 BASE_URL = "https://alerts.org.ua"
 TIME_TOKEN_RE = r"(?:(?:[01]?\d|2[0-3]):[0-5]\d|24:00)"
-TIME_RANGE_RE = re.compile(rf"(?P<start>{TIME_TOKEN_RE})\s*[-–—]\s*(?P<end>{TIME_TOKEN_RE})")
+TIME_RANGE_RE = re.compile(
+    rf"(?P<start>(?:[01]?\d|2[0-3]):[0-5]\d)\s*[-–—]\s*(?P<end>{TIME_TOKEN_RE})"
+)
 DATE_PAGE_RE = re.compile(r"/(?P<date>\d{4}-\d{2}-\d{2})\.html?$")
 TITLE_DATE_RE = re.compile(r"(?<!\d)(?P<day>\d{2})[.\-/](?P<month>\d{2})[.\-/](?P<year>\d{4})(?!\d)")
 UPDATED_RE = re.compile(
@@ -353,6 +355,8 @@ def _canonical_day_intervals(
 
     ranges: list[tuple[int, int, str]] = []
     unique_intervals = set()
+    if require_full_day and not intervals:
+        raise ValueError("Schedule does not cover the full day")
     for interval in intervals:
         if interval.state not in {"on", "off"}:
             raise ValueError("Invalid interval state")
@@ -363,9 +367,14 @@ def _canonical_day_intervals(
             end = 24 * 60
         else:
             end = interval.end.hour * 60 + interval.end.minute
-        if start >= 24 * 60 or end <= start or end > 24 * 60:
+        if start >= 24 * 60 or end > 24 * 60 or end == start:
             raise ValueError("Invalid or ambiguous interval bounds")
-        unique_intervals.add((start, end, interval.state))
+        if end < start:
+            unique_intervals.add((start, 24 * 60, interval.state))
+            if end > 0:
+                unique_intervals.add((0, end, interval.state))
+        else:
+            unique_intervals.add((start, end, interval.state))
 
     ranges.extend(unique_intervals)
 

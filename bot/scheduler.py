@@ -53,7 +53,12 @@ class LightStateScheduler:
         *,
         full_graph_text: str,
         now: datetime,
-    ) -> tuple[datetime, str] | None:
+        schedule_date: date | None,
+    ) -> tuple[datetime, str, str] | None:
+        if schedule_date is None or now.tzinfo is None:
+            return None
+
+        local_now = now.astimezone(KYIV_TZ)
         ranges: list[tuple[str, str, str]] = []
         for raw_line in full_graph_text.splitlines():
             line = raw_line.strip()
@@ -65,14 +70,55 @@ class LightStateScheduler:
             emoji, start, end = match.groups()
             ranges.append((emoji, start, end))
 
-        candidates: list[tuple[datetime, str]] = []
+        def minutes(value: str) -> int | None:
+            try:
+                hour, minute = map(int, value.split(":"))
+            except (TypeError, ValueError):
+                return None
+            if minute >= 60 or hour > 24 or (hour == 24 and minute != 0):
+                return None
+            return hour * 60 + minute
+
+        wrapped_intervals: list[tuple[int, int]] = []
         for emoji, start, end in ranges:
-            if emoji != "🔴":
+            start_minute, end_minute = minutes(start), minutes(end)
+            if (emoji in {"🔴", "🟢"} and start_minute is not None
+                    and end_minute is not None and end_minute < start_minute):
+                wrapped_intervals.append((start_minute, end_minute))
+
+        candidates: list[tuple[datetime, str, str]] = []
+        for emoji, start, end in ranges:
+            if emoji not in {"🔴", "🟢"}:
                 continue
-            start_dt = self._time_on_day(now, start)
-            if start_dt <= now:
+            start_minute, end_minute = minutes(start), minutes(end)
+            if (start_minute is None or end_minute is None or start_minute >= 24 * 60
+                    or end_minute == start_minute):
                 continue
-            candidates.append((start_dt, f"{start} – {end}"))
+            event_date = schedule_date
+            for wrapped_start, wrapped_end in wrapped_intervals:
+                if start_minute != wrapped_end:
+                    continue
+                if (local_now.date() == schedule_date
+                        and local_now.hour * 60 + local_now.minute >= wrapped_start):
+                    event_date = schedule_date + timedelta(days=1)
+                elif (local_now.date() == schedule_date + timedelta(days=1)
+                      and local_now.hour * 60 + local_now.minute < wrapped_end):
+                    event_date = schedule_date + timedelta(days=1)
+                break
+            event_base = local_now.replace(
+                year=event_date.year,
+                month=event_date.month,
+                day=event_date.day,
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            start_dt = self._time_on_day(event_base, start)
+            if start_dt <= local_now:
+                continue
+            event_type = "outage" if emoji == "🔴" else "restoration"
+            candidates.append((start_dt, event_type, f"{start} – {end}"))
 
         if not candidates:
             return None
@@ -301,9 +347,27 @@ class LightStateScheduler:
             from utils.formatting import format_graph_message
 
             full_graph_text = format_graph_message(schedule=schedule, current_state=state, now=now)
-            next_change = self._next_change_from_graph(full_graph_text=full_graph_text, now=now)
+            local_date = now.astimezone(KYIV_TZ).date()
+            source_updated_at = schedule.source_updated_at
+            source_is_stale = False
+            if source_updated_at is not None:
+                if source_updated_at.tzinfo is None:
+                    source_is_stale = True
+                else:
+                    source_age = now.astimezone(KYIV_TZ) - source_updated_at.astimezone(KYIV_TZ)
+                    source_is_stale = source_age < timedelta(0) or source_age > MAX_SOURCE_SCHEDULE_AGE
+            date_is_usable = schedule.schedule_date is not None and (
+                local_date - timedelta(days=1) <= schedule.schedule_date <= local_date + timedelta(days=1)
+            )
+            next_change = None
+            if date_is_usable and not source_is_stale:
+                next_change = self._next_change_from_graph(
+                    full_graph_text=full_graph_text,
+                    now=now,
+                    schedule_date=schedule.schedule_date,
+                )
             if next_change is not None and not is_in_quiet_hours(now, user.quiet_start, user.quiet_end):
-                start_dt, interval_text = next_change
+                start_dt, event_type, interval_text = next_change
                 warning_dt = start_dt - timedelta(minutes=5)
                 warning_lag_seconds = (now - warning_dt).total_seconds()
                 # Send only near the planned warning timestamp, not any time later
@@ -312,16 +376,26 @@ class LightStateScheduler:
                 # short catch-up window so a due warning is not lost to that
                 # request latency, while never sending it minutes late.
                 if 0 <= warning_lag_seconds <= max(20, self._interval_seconds):
-                    event_key = f"{start_dt.isoformat()}|{interval_text}"
+                    event_key = f"{event_type}|{start_dt.isoformat()}|{interval_text}"
                     last_event_key = self._last_warning_event_key_by_user.get(user.telegram_id)
                     if last_event_key != event_key:
-                        warning_text = (
-                            "⚠️ За 5 хвилин вимкнуть світло\n\n"
-                            f"📍 {user.region_name} · Черга {user.queue}.{user.subqueue}\n\n"
-                            f"🕒 Початок: {interval_text.split(' – ', 1)[0]}\n"
-                            f"🕓 Орієнтовне завершення: {interval_text.split(' – ', 1)[1]}\n\n"
-                            "За графіком alerts.org.ua."
-                        )
+                        start_text, end_text = interval_text.split(" – ", 1)
+                        if event_type == "outage":
+                            warning_text = (
+                                "⚠️ За 5 хвилин вимкнуть світло\n\n"
+                                f"📍 {user.region_name} · Черга {user.queue}.{user.subqueue}\n\n"
+                                f"🕒 Очікуваний час: {start_text}\n"
+                                f"🕓 Світла не буде з {start_text} до {end_text}\n\n"
+                                "За графіком alerts.org.ua."
+                            )
+                        else:
+                            warning_text = (
+                                "💡 За 5 хвилин має з'явитися світло\n\n"
+                                f"📍 {user.region_name} · Черга {user.queue}.{user.subqueue}\n\n"
+                                f"🕒 Очікуваний час: {start_text}\n"
+                                f"🕓 Світло буде з {start_text} до {end_text}\n\n"
+                                "За графіком alerts.org.ua."
+                            )
                         await self._bot.send_message(chat_id=user.telegram_id, text=warning_text)
                         self._last_warning_event_key_by_user[user.telegram_id] = event_key
         except Exception:
