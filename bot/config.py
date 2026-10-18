@@ -31,12 +31,12 @@ def load_settings() -> Settings:
         project_root = Path(__file__).resolve().parents[1]
         db_path = project_root / db_path
     db_path = db_path.resolve()
-    poll_interval_seconds = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
+    poll_interval_seconds = int(os.getenv("POLL_INTERVAL_SECONDS", "5"))
     request_timeout_seconds = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "15"))
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 
-    if poll_interval_seconds < 30:
-        raise ValueError("POLL_INTERVAL_SECONDS must be >= 30")
+    if poll_interval_seconds < 1:
+        raise ValueError("POLL_INTERVAL_SECONDS must be >= 1")
 
     return Settings(
         bot_token=bot_token,

@@ -28,7 +28,7 @@ class LightStateScheduler:
         bot: Bot,
         db: Database,
         parser: AlertsParser,
-        interval_seconds: int = 60,
+        interval_seconds: int = 5,
         max_parallel_checks: int = 5,
     ) -> None:
         self._bot = bot
@@ -43,6 +43,11 @@ class LightStateScheduler:
     def _time_on_day(base: datetime, hhmm: str) -> datetime:
         hour_str, minute_str = hhmm.split(":")
         return base.replace(hour=int(hour_str), minute=int(minute_str), second=0, microsecond=0)
+
+    @staticmethod
+    def _cycle_sleep_seconds(started: float, finished: float, interval: int) -> float:
+        """Keep a fixed start-to-start cadence without carrying over overruns."""
+        return max(0.0, interval - (finished - started))
 
     def _next_change_from_graph(
         self,
@@ -95,14 +100,14 @@ class LightStateScheduler:
             except Exception:
                 logger.exception("Unexpected scheduler failure")
 
-            elapsed = asyncio.get_running_loop().time() - started
-            sleep_for = max(0.0, self._interval_seconds - elapsed)
+            finished = asyncio.get_running_loop().time()
+            sleep_for = self._cycle_sleep_seconds(started, finished, self._interval_seconds)
             await asyncio.sleep(sleep_for)
 
     async def _check_once(self) -> None:
-        await self._drain_schedule_change_outbox()
         users = await self._db.get_users_with_notifications()
         if not users:
+            await self._drain_schedule_change_outbox()
             return
 
         profiles: dict[tuple[str, int, int], list[User]] = {}
@@ -272,7 +277,8 @@ class LightStateScheduler:
         if claim is None:
             return
         # Bounded work per scheduler tick; expired leases recover interrupted sends.
-        for _ in range(100):
+        # Keep low-priority schedule-change deliveries from delaying event checks.
+        for _ in range(5):
             delivery = await claim()
             if delivery is None:
                 break
@@ -317,7 +323,10 @@ class LightStateScheduler:
                 warning_lag_seconds = (now - warning_dt).total_seconds()
                 # Send only near the planned warning timestamp, not any time later
                 # in the whole 5-minute window (e.g. right after bot restart).
-                if 0 <= warning_lag_seconds < self._interval_seconds:
+                # A fetch can take longer than the polling interval. Keep a
+                # short catch-up window so a due warning is not lost to that
+                # request latency, while never sending it minutes late.
+                if 0 <= warning_lag_seconds <= max(20, self._interval_seconds):
                     event_key = f"{start_dt.isoformat()}|{event_type}|{interval_text}"
                     last_event_key = self._last_warning_event_key_by_user.get(user.telegram_id)
                     if last_event_key != event_key:

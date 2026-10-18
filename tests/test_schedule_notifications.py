@@ -396,6 +396,90 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.bot.messages), 1)
         self.assertIn("За 5 хвилин вимкнуть світло", str(self.bot.messages[0]["text"]))
 
+    async def test_warning_due_time_catches_up_without_duplicate(self) -> None:
+        user = self.users[0]
+        self.db.states[user.telegram_id] = "on"
+        schedule = DaySchedule(
+            user.region_slug, user.region_name, user.queue, user.subqueue,
+            [ScheduleInterval(time(10), time(11), "off")],
+            schedule_date=date(2026, 10, 18),
+        )
+
+        def at(hour: int, minute: int, second: int) -> datetime:
+            return datetime(2026, 10, 18, hour, minute, second, tzinfo=KYIV)
+
+        # A poll just before 09:55 must not send early.
+        await self.scheduler._check_user(user, schedule, "on", at(9, 54, 58))
+        self.assertEqual(self.bot.messages, [])
+
+        # The next wake-up, even a few seconds after the target, sends it once.
+        await self.scheduler._check_user(user, schedule, "on", at(9, 55, 4))
+        self.assertEqual(len(self.bot.messages), 1)
+        self.assertIn("За 5 хвилин вимкнуть світло", str(self.bot.messages[0]["text"]))
+
+        await self.scheduler._check_user(user, schedule, "on", at(9, 55, 5))
+        self.assertEqual(len(self.bot.messages), 1)
+
+    async def test_warning_survives_fetch_that_finishes_after_target(self) -> None:
+        user = self.users[0]
+        self.db.states[user.telegram_id] = "on"
+        profile = (user.region_slug, user.queue, user.subqueue)
+        self.parser.schedules[profile] = DaySchedule(
+            user.region_slug, user.region_name, user.queue, user.subqueue,
+            [ScheduleInterval(time(10), time(11), "off")],
+            schedule_date=date(2026, 10, 18),
+        )
+        moments = iter((
+            datetime(2026, 10, 18, 9, 54, 58, tzinfo=KYIV),
+            datetime(2026, 10, 18, 9, 55, 4, tzinfo=KYIV),
+        ))
+
+        async def slow_to_thread(function, *args):
+            await asyncio.sleep(0.01)
+            return function(*args)
+
+        with patch("bot.scheduler.asyncio.to_thread", new=slow_to_thread), patch(
+            "bot.scheduler.now_kyiv", side_effect=lambda: next(moments)
+        ):
+            await self.scheduler._check_profile(profile, [user], asyncio.Semaphore(1))
+
+        self.assertEqual(len(self.bot.messages), 1)
+        self.assertIn("За 5 хвилин вимкнуть світло", str(self.bot.messages[0]["text"]))
+
+    async def test_users_are_not_sent_to_sequentially(self) -> None:
+        users = self.users[:3]
+        active = 0
+        maximum_active = 0
+
+        class SlowBot(FakeBot):
+            async def send_message(inner_self, **kwargs: object) -> None:
+                nonlocal active, maximum_active
+                active += 1
+                maximum_active = max(maximum_active, active)
+                await asyncio.sleep(0.01)
+                active -= 1
+                await super(SlowBot, inner_self).send_message(**kwargs)
+
+        bot = SlowBot()
+        scheduler = LightStateScheduler(bot, self.db, self.parser)
+        schedule = DaySchedule(
+            "region-a", "region-a", 2, 1,
+            [ScheduleInterval(time(10), time(11), "off")],
+            schedule_date=date(2026, 10, 18),
+        )
+        for user in users:
+            self.db.states[user.telegram_id] = "on"
+        moment = datetime(2026, 10, 18, 9, 55, 4, tzinfo=KYIV)
+
+        await asyncio.gather(*(scheduler._check_user(user, schedule, "on", moment) for user in users))
+
+        self.assertEqual(maximum_active, len(users))
+
+    async def test_cycle_sleep_uses_start_to_start_interval_without_carryover(self) -> None:
+        self.assertEqual(self.scheduler._cycle_sleep_seconds(100.0, 104.0, 5), 1.0)
+        # An overrun starts the next check immediately and does not accumulate.
+        self.assertEqual(self.scheduler._cycle_sleep_seconds(100.0, 109.0, 5), 0.0)
+
     async def test_quiet_hours_suppress_final_and_state_notices(self) -> None:
         user = make_user(11)
         user.quiet_start = "11:00"

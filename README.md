@@ -79,7 +79,7 @@ python -m bot.main
 
 - `BOT_TOKEN` - токен Telegram-бота
 - `DB_PATH` - шлях до SQLite бази (за замовчуванням `lightua.db`)
-- `POLL_INTERVAL_SECONDS` - інтервал перевірки стану (мінімум 30)
+- `POLL_INTERVAL_SECONDS` - інтервал перевірки стану в секундах (за замовчуванням 5)
 - `REQUEST_TIMEOUT_SECONDS` - timeout HTTP-запитів до `alerts.org.ua`
 - `LOG_LEVEL` - рівень логування (`DEBUG`, `INFO`, `WARNING`, `ERROR`)
 
@@ -88,7 +88,7 @@ python -m bot.main
 ```env
 BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
 DB_PATH=lightua.db
-POLL_INTERVAL_SECONDS=60
+POLL_INTERVAL_SECONDS=5
 REQUEST_TIMEOUT_SECONDS=15
 LOG_LEVEL=INFO
 ```
