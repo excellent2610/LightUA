@@ -30,7 +30,7 @@ def get_router(db: Database) -> Router:
 
         await state.clear()
         await state.set_state(QuietStates.waiting_start)
-        await message.answer("Введіть початок тихої години у форматі HH:MM (наприклад 23:00):")
+        await message.answer("Введи початок тихої години у форматі HH:MM, наприклад 23:00. Інтервал може переходити через північ.")
 
     @router.message(QuietStates.waiting_start, F.text & ~F.text.startswith("/"))
     async def quiet_start_input(message: Message, state: FSMContext) -> None:
@@ -42,7 +42,7 @@ def get_router(db: Database) -> Router:
 
         await state.update_data(quiet_start=parsed.strftime("%H:%M"))
         await state.set_state(QuietStates.waiting_end)
-        await message.answer("Введіть завершення тихої години у форматі HH:MM (наприклад 07:00):")
+        await message.answer("Введи завершення у форматі HH:MM, наприклад 07:00.")
 
     @router.message(QuietStates.waiting_end, F.text & ~F.text.startswith("/"))
     async def quiet_end_input(message: Message, state: FSMContext) -> None:
@@ -74,6 +74,6 @@ def get_router(db: Database) -> Router:
             await message.answer("Профіль не знайдено. Виконайте /start")
             return
 
-        await message.answer(f"Тиха година встановлена: {quiet_start} - {quiet_end}")
+        await message.answer(f"🌙 Тиху годину встановлено: {quiet_start}–{quiet_end}")
 
     return router

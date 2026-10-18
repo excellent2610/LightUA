@@ -55,15 +55,10 @@ def get_router(db: Database, parser: AlertsParser) -> Router:
         await ad_manager.send_with_ad(
             message.bot,
             message.chat.id,
+            f"👋 Привіт! Це Alerts_Light\n\n"
+            "Допоможу стежити за графіком і вчасно попереджу про зміни.\n\n"
             f"{light_line}\n\n{status_line}\n\n"
-            "Команди:\n"
-            "/graph\n"
-            "/notify_on\n"
-            "/notify_off\n"
-            "/quiet\n"
-            "/status\n"
-            "/register\n"
-            "/help",
+            "Команди: /graph · /status · /help",
         )
 
     return router

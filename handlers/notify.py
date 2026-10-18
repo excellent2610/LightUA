@@ -69,7 +69,7 @@ def _build_notify_on_text(
     now_dt = now_kyiv()
     next_warning = _next_warning_from_graph(full_graph_text=full_graph_text, now_dt=now_dt)
     header = (
-        "🔔 Сповіщення увімкнено.\n"
+        "🔔 Сповіщення увімкнено!\n\n"
         f"{region_name} · Черга {queue}.{subqueue}\n"
         "Попередження за 5 хв."
     )
@@ -99,8 +99,8 @@ def get_router(db: Database) -> Router:
         await ad_manager.send_with_ad(
             message.bot,
             message.chat.id,
-            "Команди:\n"
-            "/start - почати / змінити профіль\n"
+            "Доступні команди:\n"
+            "/start — налаштувати або змінити профіль\n"
             "/graph - графік на сьогодні\n"
             "/notify_on - увімкнути сповіщення\n"
             "/notify_off - вимкнути сповіщення\n"
@@ -124,7 +124,13 @@ def get_router(db: Database) -> Router:
             )
             return
 
-        await db.set_notifications(message.from_user.id, True)
+        updated = await db.set_notifications(message.from_user.id, True)
+        if not updated:
+            await ad_manager.send_with_ad(
+                message.bot, message.chat.id,
+                "Не вдалося оновити налаштування. Спробуй ще раз: /notify_on",
+            )
+            return
 
         try:
             settings = load_settings()
@@ -137,7 +143,7 @@ def get_router(db: Database) -> Router:
             )
             schedule.region_name = user.region_name
             current_state = schedule.state_at(now_kyiv())
-            full_graph_text = format_graph_message(schedule=schedule, current_state=current_state)
+            full_graph_text = format_graph_message(schedule=schedule, current_state=current_state, now=now_kyiv())
             await ad_manager.send_with_ad(
                 message.bot,
                 message.chat.id,
@@ -206,7 +212,7 @@ def get_router(db: Database) -> Router:
                 (
                     "🧪 ТЕСТ СПОВІЩЕННЯ\n"
                     "Це перевірка доставки push-повідомлень.\n\n"
-                    "Черкаська область · Черга 4.1\n"
+                    f"{user.region_name} · Черга {user.queue}.{user.subqueue}\n"
                     "Затримка: 5 хв"
                 ),
             )
@@ -227,11 +233,17 @@ def get_router(db: Database) -> Router:
             )
             return
 
-        await db.set_notifications(message.from_user.id, False)
+        updated = await db.set_notifications(message.from_user.id, False)
+        if not updated:
+            await ad_manager.send_with_ad(
+                message.bot, message.chat.id,
+                "Не вдалося оновити налаштування. Спробуй ще раз: /notify_off",
+            )
+            return
         await ad_manager.send_with_ad(
             message.bot,
             message.chat.id,
-            "Сповіщення вимкнено.",
+            "🔕 Сповіщення вимкнено\n\nГрафік і стан можна переглянути: /graph · /status",
         )
 
     return router

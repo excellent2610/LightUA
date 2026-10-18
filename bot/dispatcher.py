@@ -152,6 +152,6 @@ def create_dispatcher(db: Database, parser: AlertsParser) -> Dispatcher:
     dispatcher.include_router(get_graph_router(db=db, parser=parser))
     dispatcher.include_router(get_notify_router(db=db))
     dispatcher.include_router(get_quiet_router(db=db))
-    dispatcher.include_router(get_status_router(db=db))
+    dispatcher.include_router(get_status_router(db=db, parser=parser))
 
     return dispatcher

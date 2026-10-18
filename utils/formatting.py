@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from db.models import User
@@ -21,37 +22,60 @@ def format_status_message(user: User) -> str:
     region_name = normalize_region_label(user.region_name)
     notifications = "увімкнені" if user.notifications_enabled else "вимкнені"
     if user.quiet_start and user.quiet_end:
-        quiet = f"{format_time(user.quiet_start)} - {format_time(user.quiet_end)}"
+        quiet = f"{format_time(user.quiet_start)}–{format_time(user.quiet_end)}"
     else:
         quiet = "не налаштовано"
 
     return (
-        "⚙️ Поточний профіль\n"
-        f"Область: {region_name}\n"
-        f"Черга: {user.queue}\n"
-        f"Підчерга: {user.subqueue}\n"
-        f"Сповіщення: {notifications}\n"
-        f"Тиха година: {quiet}"
+        "⚙️ Твій профіль\n\n"
+        f"📍 {region_name}\n"
+        f"🔌 Черга: {user.queue}.{user.subqueue}\n"
+        f"🔔 Сповіщення: {notifications}\n"
+        f"🌙 Тиха година: {quiet}"
     )
 
 
-def format_graph_message(schedule: "DaySchedule", current_state: str) -> str:
+def format_graph_message(schedule: "DaySchedule", current_state: str, now: datetime | None = None) -> str:
     region_name = normalize_region_label(schedule.region_name)
-    lines = [
-        f"📊 Графік на сьогодні ({region_name} · {schedule.queue}.{schedule.subqueue})",
-    ]
+    today = now.date() if now else None
+    schedule_day = schedule.schedule_date
+    day_label = (
+        schedule_day.strftime("%d.%m.%Y")
+        if schedule_day is not None and today is not None and schedule_day != today
+        else "сьогодні"
+    )
+    lines = [f"☀️ Світло {day_label}", "", f"📍 {region_name} · Черга {schedule.queue}.{schedule.subqueue}"]
 
     if not schedule.intervals:
-        lines.append("Дані про інтервали відсутні.")
+        lines.extend(["", "ℹ️ Інтервали графіка відсутні."])
     else:
+        lines.extend(["", "🟢 Світло є"])
         for interval in schedule.intervals:
-            emoji = "🔴" if interval.state == "off" else "🟢"
-            label = "Без світла" if interval.state == "off" else "Світло є"
             end_time = "24:00" if interval.ends_at_midnight else interval.end.strftime("%H:%M")
-            lines.append(f"{emoji} {interval.start.strftime('%H:%M')} - {end_time} ({label})")
+            if interval.state == "on":
+                lines.append(f"🟢 {interval.start.strftime('%H:%M')}–{end_time}")
+        lines.extend(["", "🔴 Без світла"])
+        for interval in schedule.intervals:
+            end_time = "24:00" if interval.ends_at_midnight else interval.end.strftime("%H:%M")
+            if interval.state == "off":
+                lines.append(f"🔴 {interval.start.strftime('%H:%M')}–{end_time}")
 
-    lines.append("")
-    lines.append(f"Поточний стан: {format_light_change_message(current_state, region_name, schedule.queue, schedule.subqueue)}")
+    if current_state in {"on", "off"}:
+        lines.extend(["", f"⚡ Зараз {'світло є' if current_state == 'on' else 'світла немає'}"])
+        if now is not None:
+            upcoming = []
+            for interval in schedule.intervals:
+                if interval.state == current_state:
+                    continue
+                boundary = interval.start
+                candidate = now.replace(hour=boundary.hour, minute=boundary.minute, second=0, microsecond=0)
+                if candidate > now:
+                    upcoming.append(candidate)
+            if upcoming:
+                next_event = min(upcoming)
+                action = "відключення" if current_state == "on" else "відновлення світла"
+                lines.append(f"Найближче {action} — о {next_event:%H:%M}.")
+    lines.extend(["", "Джерело: alerts.org.ua"])
     return "\n".join(lines)
 
 

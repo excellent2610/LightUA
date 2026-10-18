@@ -122,7 +122,7 @@ async def send_graph_for_user(
         )
         schedule.region_name = user.region_name
         current_state = schedule.state_at(now_kyiv())
-        full_graph_text = format_graph_message(schedule=schedule, current_state=current_state)
+        full_graph_text = format_graph_message(schedule=schedule, current_state=current_state, now=now_kyiv())
         if compact:
             compact_messages = _build_compact_graph_messages(full_graph_text=full_graph_text, current_state=current_state)
             if compact_messages:

@@ -97,7 +97,7 @@ async def begin_registration(
     region_map = {region.slug: region.name for region in cleaned_regions}
     keyboard = _build_regions_keyboard(cleaned_regions, session_token=session_token)
 
-    sent = await message.answer("Оберіть область:", reply_markup=keyboard)
+    sent = await message.answer("📍 Обери область:", reply_markup=keyboard)
     await state.update_data(
         region_map=region_map,
         region_session=session_token,
@@ -253,15 +253,11 @@ def get_router(db: Database, parser: AlertsParser | None = None) -> Router:
         await state.clear()
 
         await message.answer(
-            "Реєстрація завершена.\n"
-            f"Профіль: {normalize_region_label(region_name)} · {queue}.{subqueue}\n\n"
-            "Команди:\n"
-            "/graph - графік на сьогодні\n"
-            "/notify_on - увімкнути сповіщення\n"
-            "/notify_off - вимкнути сповіщення\n"
-            "/quiet - налаштувати тиху годину\n"
-            "/status - переглянути профіль\n"
-            "/help - показати довідку"
+            "✅ Готово, твій профіль налаштовано!\n\n"
+            f"📍 {normalize_region_label(region_name)}\n"
+            f"🔌 Черга {queue}.{subqueue}\n\n"
+            "Графік: /graph · Сповіщення: /notify_on або /notify_off\n"
+            "Тиха година: /quiet · Профіль: /status · Довідка: /help"
         )
         if parser is not None:
             await send_graph_for_user(

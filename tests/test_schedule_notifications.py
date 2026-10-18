@@ -394,7 +394,7 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
             await self.scheduler._check_user(self.users[0], schedule, "on", NOW)
 
         self.assertEqual(len(self.bot.messages), 1)
-        self.assertIn("Попередження за 5 хв", str(self.bot.messages[0]["text"]))
+        self.assertIn("За 5 хвилин вимкнуть світло", str(self.bot.messages[0]["text"]))
 
     async def test_quiet_hours_suppress_final_and_state_notices(self) -> None:
         user = make_user(11)
@@ -1164,9 +1164,9 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
         }
         self.assertEqual(set(morning_messages), {11, 12, 21, 31})
         self.assertIn("Черга: 2, підчерга 1", morning_messages[11])
-        self.assertIn("10:00 - 11:00", morning_messages[11])
-        self.assertIn("11:00 - 12:00", morning_messages[21])
-        self.assertIn("12:00 - 13:00", morning_messages[31])
+        self.assertIn("🔴 10:00–11:00", morning_messages[11])
+        self.assertIn("🔴 11:00–12:00", morning_messages[21])
+        self.assertIn("🔴 12:00–13:00", morning_messages[31])
 
 
 if __name__ == "__main__":

@@ -252,7 +252,7 @@ class LightStateScheduler:
 
             text = (
                 f"🔄 Графік для вашої черги {schedule.queue}.{schedule.subqueue} було оновлено.\n\n"
-                "📅 Новий графік:\n" + format_graph_message(schedule, schedule.state_at(now))
+                "📅 Новий графік:\n" + format_graph_message(schedule, schedule.state_at(now), now=now)
             )
         errors = 0
         for user in eligible:
@@ -309,7 +309,7 @@ class LightStateScheduler:
         try:
             from utils.formatting import format_graph_message
 
-            full_graph_text = format_graph_message(schedule=schedule, current_state=state)
+            full_graph_text = format_graph_message(schedule=schedule, current_state=state, now=now)
             next_change = self._next_change_from_graph(full_graph_text=full_graph_text, now=now)
             if next_change is not None and not is_in_quiet_hours(now, user.quiet_start, user.quiet_end):
                 start_dt, event_type, interval_text = next_change
@@ -321,11 +321,22 @@ class LightStateScheduler:
                     event_key = f"{start_dt.isoformat()}|{event_type}|{interval_text}"
                     last_event_key = self._last_warning_event_key_by_user.get(user.telegram_id)
                     if last_event_key != event_key:
-                        warning_text = (
-                            "⚠️ Попередження за 5 хв\n"
-                            f"{event_type} ({user.region_name} · {user.queue}.{user.subqueue})\n\n"
-                            f"Інтервал: {interval_text}"
-                        )
+                        if event_type == "ВІДКЛЮЧЕННЯ":
+                            warning_text = (
+                                "⚠️ За 5 хвилин вимкнуть світло\n\n"
+                                f"📍 {user.region_name} · Черга {user.queue}.{user.subqueue}\n\n"
+                                f"🕒 Початок: {interval_text.split(' – ', 1)[0]}\n"
+                                f"🕓 Орієнтовне завершення: {interval_text.split(' – ', 1)[1]}\n\n"
+                                "За графіком alerts.org.ua."
+                            )
+                        else:
+                            warning_text = (
+                                "💡 За 5 хвилин має з'явитися світло\n\n"
+                                f"📍 {user.region_name} · Черга {user.queue}.{user.subqueue}\n\n"
+                                f"🕒 Очікуваний час: {interval_text.split(' – ', 1)[0]}\n"
+                                f"🕓 Інтервал відключення: {interval_text}\n\n"
+                                "За графіком alerts.org.ua."
+                            )
                         await self._bot.send_message(chat_id=user.telegram_id, text=warning_text)
                         self._last_warning_event_key_by_user[user.telegram_id] = event_key
         except Exception:
@@ -437,7 +448,7 @@ class LightStateScheduler:
         if schedule.confirmed_empty:
             graph_text = "📊 На сьогодні відключень не заплановано."
         else:
-            graph_text = format_graph_message(schedule=schedule, current_state=state)
+            graph_text = format_graph_message(schedule=schedule, current_state=state, now=now)
         message = (
             "☀️ Графік відключень на сьогодні\n\n"
             f"📍 Область: {user.region_name}\n"
