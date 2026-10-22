@@ -618,7 +618,7 @@ class LightStateScheduler:
         try:
             await self._bot.send_message(
                 chat_id=user.telegram_id,
-                text="✅ На сьогодні більше немає запланованих відключень світла! Гарного вечора 💡",
+                text="✅ На сьогодні за графіком більше запланованих відключень світла немає! Гарного вечора 💡",
             )
         except Exception as exc:
             # A timeout/network failure has an ambiguous outcome; do not retry it
