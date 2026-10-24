@@ -61,7 +61,8 @@ def format_graph_message(schedule: "DaySchedule", current_state: str, now: datet
                 lines.append(f"🔴 {interval.start.strftime('%H:%M')}–{end_time}")
 
     if current_state in {"on", "off"}:
-        lines.extend(["", f"⚡ Зараз {'світло є' if current_state == 'on' else 'світла немає'}"])
+        status = "⚡ За графіком зараз світло є" if current_state == "on" else "⚡ За графіком зараз світла немає"
+        lines.extend(["", status])
         if now is not None:
             upcoming = []
             for interval in schedule.intervals:

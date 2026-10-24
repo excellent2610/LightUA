@@ -25,7 +25,27 @@ class FormattingTests(unittest.TestCase):
         self.assertIn("🟢 22:00–24:00", text)
         self.assertIn("🔴 02:00–03:00", text)
         self.assertEqual(text.count("00:00–02:00"), 1)
+        self.assertIn("⚡ За графіком зараз світло є", text)
+        self.assertNotIn("⚡ Зараз світло є", text)
+        self.assertNotIn("⚡ Зараз світла немає", text)
         self.assertIn("Найближче відключення — о 02:00", text)
+
+    def test_graph_status_for_currently_off_state_and_next_restoration(self):
+        schedule = DaySchedule(
+            "cherkasy", "Черкаська область", 4, 2,
+            [
+                ScheduleInterval(time(0), time(8), "off"),
+                ScheduleInterval(time(8), time(10), "on"),
+                ScheduleInterval(time(10), time(12), "off"),
+            ],
+            schedule_date=date(2026, 10, 18),
+        )
+        now = datetime(2026, 10, 18, 7, 0, tzinfo=ZoneInfo("Europe/Kyiv"))
+        text = format_graph_message(schedule, "off", now)
+        self.assertIn("⚡ За графіком зараз світла немає", text)
+        self.assertNotIn("⚡ Зараз світло є", text)
+        self.assertNotIn("⚡ Зараз світла немає", text)
+        self.assertIn("Найближче відновлення світла — о 08:00", text)
 
     def test_empty_graph_does_not_invent_state(self):
         schedule = DaySchedule("cherkasy", "Черкаська область", 4, 2, [], confirmed_empty=True)
