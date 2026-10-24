@@ -1,6 +1,8 @@
+
 from __future__ import annotations
 
 import re
+import time as time_module
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from urllib.parse import urljoin, urlparse
@@ -89,7 +91,12 @@ class DaySchedule:
     def state_at(self, moment: datetime) -> str:
         local_time = moment.astimezone(KYIV_TZ).time()
         for interval in self.intervals:
-            if _time_in_interval(local_time, interval.start, interval.end, interval.ends_at_midnight):
+            if _time_in_interval(
+                local_time,
+                interval.start,
+                interval.end,
+                interval.ends_at_midnight,
+            ):
                 return interval.state
         return self.default_state
 
@@ -109,6 +116,35 @@ class AlertsParser:
 
     def get_schedule(self, region_slug: str, queue: int, subqueue: int) -> DaySchedule:
         region_slug = region_slug.strip().strip("/")
+
+        # Backward compatibility with legacy region slugs.
+        legacy_slugs = {
+            "volynska": "volynska-oblast",
+            "vinnytska": "vinnytcka-oblast",
+            "dnipropetrovska": "dnipropetrovska-oblast",
+            "donetska": "donetcka-oblast",
+            "zhytomyrska": "zhytomyrska-oblast",
+            "zakarpatska": "zakarpatska-oblast",
+            "zaporizka": "zaporizka-oblast",
+            "kyivska": "kyivska-oblast",
+            "kirovogradska": "kirovogradska-oblast",
+            "luganska": "luganska-oblast",
+            "lvivska": "lvivska-oblast",
+            "mykolaivska": "mykolaivska-oblast",
+            "odeska": "odeska-oblast",
+            "poltavska": "poltavska-oblast",
+            "rivnenska": "rivnenska-oblast",
+            "sumska": "sumska-oblast",
+            "ternopilska": "ternopilska-oblast",
+            "harkivska": "harkivska-oblast",
+            "hersonska": "hersonska-oblast",
+            "hmelnitska": "hmelnitcka-oblast",
+            "cherkaska": "cherkaska-oblast",
+            "chernivetska": "chernivetcka-oblast",
+            "chernihivska": "chernigivska-oblast",
+            "ivano-frankivska": "ivano-frankivska-oblast",
+        }
+        region_slug = legacy_slugs.get(region_slug, region_slug)
         region_url = f"{BASE_URL}/{region_slug}/"
 
         html = self._fetch_url(region_url)
@@ -134,8 +170,15 @@ class AlertsParser:
                 latest_text = latest_soup.get_text("\n", strip=True)
                 latest_normalized = _normalize_text(latest_text)
                 if not _looks_like_anti_bot_page(latest_normalized):
-                    intervals = _extract_group_intervals(text=latest_text, queue=queue, subqueue=subqueue)
-                    confirmed_empty = any(keyword in latest_normalized for keyword in NO_OUTAGES_KEYWORDS)
+                    intervals = _extract_group_intervals(
+                        text=latest_text,
+                        queue=queue,
+                        subqueue=subqueue,
+                    )
+                    confirmed_empty = any(
+                        keyword in latest_normalized
+                        for keyword in NO_OUTAGES_KEYWORDS
+                    )
                     if intervals or confirmed_empty:
                         source_url = latest_url
                         source_soup = latest_soup
@@ -164,20 +207,45 @@ class AlertsParser:
             confirmed_empty=confirmed_empty,
         )
 
-    def get_current_state(self, region_slug: str, queue: int, subqueue: int) -> tuple[str, DaySchedule]:
-        schedule = self.get_schedule(region_slug=region_slug, queue=queue, subqueue=subqueue)
+    def get_current_state(
+        self,
+        region_slug: str,
+        queue: int,
+        subqueue: int,
+    ) -> tuple[str, DaySchedule]:
+        schedule = self.get_schedule(
+            region_slug=region_slug,
+            queue=queue,
+            subqueue=subqueue,
+        )
         state = schedule.state_at(now_kyiv())
         return state, schedule
 
     def _fetch_url(self, url: str) -> str:
-        try:
-            response = self._session.get(url, timeout=self.timeout_seconds)
-            response.raise_for_status()
-            return response.text
-        except requests.RequestException as exc:
-            raise RegionUnavailableError(f"Не вдалося отримати сторінку: {url}") from exc
+        last_error: requests.RequestException | None = None
 
-    def _find_latest_schedule_url(self, soup: BeautifulSoup, region_slug: str) -> str | None:
+        for attempt in range(3):
+            try:
+                response = self._session.get(
+                    url,
+                    timeout=self.timeout_seconds,
+                )
+                response.raise_for_status()
+                return response.text
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt < 2:
+                    time_module.sleep(1 + attempt)
+
+        raise RegionUnavailableError(
+            f"Не вдалося отримати сторінку після 3 спроб: {url}"
+        ) from last_error
+
+    def _find_latest_schedule_url(
+        self,
+        soup: BeautifulSoup,
+        region_slug: str,
+    ) -> str | None:
         candidates: list[tuple[datetime, str]] = []
         target = f"/{region_slug.lower()}/"
 
@@ -213,21 +281,33 @@ class AlertsParser:
         if title:
             title_text = " ".join(title.get_text(" ", strip=True).split())
             # Example: "Черкаська область 💡 графік відключення світла 21.02.2026"
-            match = re.search(r"([А-ЯІЇЄҐA-Z][^|]+?область)\b", title_text, flags=re.IGNORECASE)
+            match = re.search(
+                r"([А-ЯІЇЄҐA-Z][^|]+?область)\b",
+                title_text,
+                flags=re.IGNORECASE,
+            )
             if match:
                 return match.group(1).strip()
 
         h1 = soup.find("h1")
         if h1:
             h1_text = " ".join(h1.get_text(" ", strip=True).split())
-            match = re.search(r"([А-ЯІЇЄҐA-Z][^|]+?область)\b", h1_text, flags=re.IGNORECASE)
+            match = re.search(
+                r"([А-ЯІЇЄҐA-Z][^|]+?область)\b",
+                h1_text,
+                flags=re.IGNORECASE,
+            )
             if match:
                 return match.group(1).strip()
 
         return " ".join(piece.capitalize() for piece in region_slug.split("-"))
 
 
-def _extract_group_intervals(text: str, queue: int, subqueue: int) -> list[ScheduleInterval]:
+def _extract_group_intervals(
+    text: str,
+    queue: int,
+    subqueue: int,
+) -> list[ScheduleInterval]:
     lines = _prepare_lines(text)
     blocks = _collect_target_blocks(lines=lines, queue=queue, subqueue=subqueue)
     parsed: list[ScheduleInterval] = []
@@ -257,7 +337,11 @@ def _prepare_lines(text: str) -> list[str]:
     return result
 
 
-def _collect_target_blocks(lines: list[str], queue: int, subqueue: int) -> list[list[str]]:
+def _collect_target_blocks(
+    lines: list[str],
+    queue: int,
+    subqueue: int,
+) -> list[list[str]]:
     header_re = re.compile(
         r"^\s*(?:група|черга)\s*(?P<queue>\d+)(?:\s*[./-]\s*(?P<subqueue>\d+))?\b.*$",
         flags=re.IGNORECASE,
@@ -266,23 +350,41 @@ def _collect_target_blocks(lines: list[str], queue: int, subqueue: int) -> list[
     for idx, line in enumerate(lines):
         match = header_re.match(line)
         if match:
-            headers.append((idx, int(match.group("queue")),
-                            int(match.group("subqueue")) if match.group("subqueue") else None))
+            headers.append(
+                (
+                    idx,
+                    int(match.group("queue")),
+                    int(match.group("subqueue")) if match.group("subqueue") else None,
+                )
+            )
 
-    has_split_groups = any(group == queue and sub is not None for _, group, sub in headers)
+    has_split_groups = any(
+        group == queue and sub is not None
+        for _, group, sub in headers
+    )
     blocks: list[list[str]] = []
     for header_index, (line_index, group, sub) in enumerate(headers):
-        selected = (group == queue and sub == subqueue) if has_split_groups else (group == queue and sub is None)
+        selected = (
+            group == queue and sub == subqueue
+        ) if has_split_groups else (
+            group == queue and sub is None
+        )
         if not selected:
             continue
-        end_index = headers[header_index + 1][0] if header_index + 1 < len(headers) else min(len(lines), line_index + 120)
+        end_index = (
+            headers[header_index + 1][0]
+            if header_index + 1 < len(headers)
+            else min(len(lines), line_index + 120)
+        )
         block = lines[line_index + 1:end_index]
         if block:
             blocks.append(block)
     return blocks
 
 
-def _parse_intervals_from_block_lines(block_lines: list[str]) -> list[ScheduleInterval]:
+def _parse_intervals_from_block_lines(
+    block_lines: list[str],
+) -> list[ScheduleInterval]:
     result: list[ScheduleInterval] = []
     for index, line in enumerate(block_lines):
         match = TIME_RANGE_RE.search(line)
@@ -291,7 +393,7 @@ def _parse_intervals_from_block_lines(block_lines: list[str]) -> list[ScheduleIn
 
         start = _parse_time(match.group("start"))
         end = _parse_time(match.group("end"))
-        tail = line[match.end() :].strip()
+        tail = line[match.end():].strip()
         state = _guess_state(tail) or _guess_state(line)
 
         # Some pages render OFF/ON in a separate next element/line.
@@ -310,9 +412,14 @@ def _parse_intervals_from_block_lines(block_lines: list[str]) -> list[ScheduleIn
         if state is None:
             continue
 
-        result.append(ScheduleInterval(
-            start=start, end=end, state=state, ends_at_midnight=match.group("end") == "24:00"
-        ))
+        result.append(
+            ScheduleInterval(
+                start=start,
+                end=end,
+                state=state,
+                ends_at_midnight=match.group("end") == "24:00",
+            )
+        )
 
     return result
 
@@ -324,7 +431,12 @@ def _parse_time(raw: str) -> time:
     return datetime.strptime(value, "%H:%M").time()
 
 
-def _time_in_interval(current: time, start: time, end: time, ends_at_midnight: bool = False) -> bool:
+def _time_in_interval(
+    current: time,
+    start: time,
+    end: time,
+    ends_at_midnight: bool = False,
+) -> bool:
     if ends_at_midnight:
         return current >= start
     if start == end:
@@ -377,7 +489,6 @@ def _canonical_day_intervals(
             unique_intervals.add((start, end, interval.state))
 
     ranges.extend(unique_intervals)
-
     ranges.sort()
     runs: list[tuple[int, int, str]] = []
     cursor = 0
@@ -446,7 +557,11 @@ def _extract_schedule_date(soup: BeautifulSoup, source_url: str) -> date | None:
         match = TITLE_DATE_RE.search(" ".join(element.get_text(" ", strip=True).split()))
         if match:
             try:
-                return date(int(match.group("year")), int(match.group("month")), int(match.group("day")))
+                return date(
+                    int(match.group("year")),
+                    int(match.group("month")),
+                    int(match.group("day")),
+                )
             except ValueError:
                 continue
     return None
@@ -458,8 +573,12 @@ def _extract_source_updated_at(soup: BeautifulSoup) -> datetime | None:
         return None
     try:
         return datetime(
-            int(match.group("year")), int(match.group("month")), int(match.group("day")),
-            int(match.group("hour")), int(match.group("minute")), tzinfo=KYIV_TZ,
+            int(match.group("year")),
+            int(match.group("month")),
+            int(match.group("day")),
+            int(match.group("hour")),
+            int(match.group("minute")),
+            tzinfo=KYIV_TZ,
         )
     except ValueError:
         return None
