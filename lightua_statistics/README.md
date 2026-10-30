@@ -19,6 +19,11 @@ identifiers. The command also logs the total and the existing 24-hour active
 user metric. Advertising statistics are intentionally not implemented until
 the project has source data for them.
 
+The CSV is not refreshed automatically by the bot; run the command above to
+refresh it. For routine updates, schedule it as a separate daily job after user
+data changes, rather than running a database-wide aggregation on every
+registration or bot startup.
+
 The output path is based on the package location, not the current working
 directory. To run the module from another directory, first change to the
 repository root, install the project in the active environment if package

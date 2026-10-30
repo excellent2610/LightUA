@@ -36,6 +36,13 @@ def write_regions_csv(
     statistics: UserStatistics,
     output_path: str | Path = DEFAULT_OUTPUT_PATH,
 ) -> None:
+    region_total = sum(count for _, count in statistics.users_by_region)
+    if region_total != statistics.total_users:
+        raise ValueError(
+            "Regional user counts must sum to total_users "
+            f"(got {region_total}, expected {statistics.total_users})"
+        )
+
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
@@ -51,7 +58,7 @@ def write_regions_csv(
             delete=False,
         ) as output_file:
             temporary_path = Path(output_file.name)
-            writer = csv.writer(output_file)
+            writer = csv.writer(output_file, lineterminator="\n")
             writer.writerow(("Область", "Користувачів"))
             writer.writerows(statistics.users_by_region)
 

@@ -161,6 +161,24 @@ class StatisticsTests(unittest.TestCase):
         )
         self.assertEqual(stats.total_users, 12)
 
+    def test_all_users_are_counted_once_including_unknown_regions(self):
+        stats = aggregate_user_rows(
+            [
+                aggregate_row(None, 2),
+                aggregate_row("", 3),
+                aggregate_row("Невідома область", 4),
+                aggregate_row("Черкаська область", 5),
+                aggregate_row("черкаська", 7),
+            ]
+        )
+
+        self.assertEqual(stats.total_users, 21)
+        self.assertEqual(
+            stats.users_by_region,
+            (("Черкаська область", 12), (UNKNOWN_REGION, 9)),
+        )
+        self.assertEqual(sum(count for _, count in stats.users_by_region), stats.total_users)
+
     def test_grouping_query_returns_only_aggregates_without_personal_data(self):
         class FakeConnection:
             async def fetch(self, query: str):
@@ -352,6 +370,7 @@ class StatisticsTests(unittest.TestCase):
                 [UNKNOWN_REGION, "2"],
             ],
         )
+        self.assertEqual(sum(int(row[1]) for row in rows[1:]), stats.total_users)
 
     def test_empty_statistics_write_header_only_csv(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -411,6 +430,20 @@ class StatisticsTests(unittest.TestCase):
 
             self.assertEqual(output_path.read_text(encoding="utf-8"), previous_content)
             self.assertEqual(list(Path(directory).glob(".*.tmp")), [])
+
+    def test_inconsistent_statistics_are_not_written(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "regions.csv"
+            previous_content = "old,complete\n"
+            output_path.write_text(previous_content, encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "must sum to total_users"):
+                write_regions_csv(
+                    UserStatistics(2, 0, (("Черкаська область", 1),)),
+                    output_path,
+                )
+
+            self.assertEqual(output_path.read_text(encoding="utf-8"), previous_content)
 
 
 if __name__ == "__main__":
