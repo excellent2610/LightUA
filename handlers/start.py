@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 def get_router(db: Database, parser: AlertsParser) -> Router:
     router = Router(name="start")
-    ad_manager = get_ad_manager()
+    ad_manager = get_ad_manager(db=db)
 
     @router.message(CommandStart(), StateFilter("*"))
     async def start_command(message: Message, state: FSMContext) -> None:
@@ -59,6 +59,7 @@ def get_router(db: Database, parser: AlertsParser) -> Router:
             "Допоможу стежити за графіком і вчасно попереджу про зміни.\n\n"
             f"{light_line}\n\n{status_line}\n\n"
             "Команди: /graph · /status · /help",
+            telegram_id=telegram_id,
         )
 
     return router

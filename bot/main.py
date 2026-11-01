@@ -27,6 +27,8 @@ except ModuleNotFoundError:
     from db.database import Database
     from parsing.alerts_parser import AlertsParser
 
+DATABASE_APP_KEY = web.AppKey("database", Database)
+
 
 # ---------------- LOGGING ----------------
 def configure_logging(level_name: str) -> None:
@@ -81,9 +83,44 @@ async def handle_ping(request):
     return web.Response(text="OK")
 
 
-async def start_web_server():
+async def handle_ad_click(request: web.Request) -> web.StreamResponse:
+    campaign_id = request.match_info.get("campaign_id", "")
+    raw_user_id = request.query.get("user_id", "")
+    signature = request.query.get("signature", "")
+    if (
+        not campaign_id
+        or len(campaign_id) > 128
+        or not raw_user_id.isdecimal()
+        or len(raw_user_id) > 19
+        or len(signature) != 64
+    ):
+        raise web.HTTPNotFound()
+
+    try:
+        user_id = int(raw_user_id)
+        if user_id <= 0:
+            raise ValueError("Invalid user ID")
+        destination = await request.app[DATABASE_APP_KEY].record_ad_click(
+            campaign_id,
+            user_id,
+            signature,
+        )
+    except ValueError:
+        raise web.HTTPNotFound() from None
+    except Exception:
+        logging.getLogger(__name__).exception("Could not record an advertising click")
+        raise web.HTTPServiceUnavailable(text="Click tracking is temporarily unavailable")
+
+    if destination is None:
+        raise web.HTTPNotFound()
+    raise web.HTTPFound(location=destination)
+
+
+async def start_web_server(db: Database):
     app = web.Application()
+    app[DATABASE_APP_KEY] = db
     app.router.add_get("/ping", handle_ping)
+    app.router.add_get("/ads/click/{campaign_id}", handle_ad_click)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -122,34 +159,41 @@ async def run() -> None:
 
     with single_instance_lock(lock_path):
         database = Database(settings.db_path)
-        await database.init()
-
-        parser = AlertsParser(timeout_seconds=settings.request_timeout_seconds)
-        bot = Bot(token=settings.bot_token)
-        dispatcher = create_dispatcher(db=database, parser=parser)
-
-        scheduler = LightStateScheduler(
-            bot=bot,
-            db=database,
-            parser=parser,
-            interval_seconds=settings.poll_interval_seconds,
-        )
-
-        # 🔥 Запускаємо ВСЕ паралельно
-        await scheduler.start()
-        await start_web_server()
-
-        await bot.delete_webhook(drop_pending_updates=True)
-        await configure_bot_commands(bot)
-
+        bot: Bot | None = None
+        scheduler: LightStateScheduler | None = None
         try:
+            await database.init()
+            parser = AlertsParser(timeout_seconds=settings.request_timeout_seconds)
+            bot = Bot(token=settings.bot_token)
+            dispatcher = create_dispatcher(db=database, parser=parser)
+            scheduler = LightStateScheduler(
+                bot=bot,
+                db=database,
+                parser=parser,
+                interval_seconds=settings.poll_interval_seconds,
+            )
+
+            # Start the application services only after cleanup is guaranteed.
+            await scheduler.start()
+            await start_web_server(database)
+
+            await bot.delete_webhook(drop_pending_updates=True)
+            await configure_bot_commands(bot)
+
             await dispatcher.start_polling(
                 bot,
                 allowed_updates=dispatcher.resolve_used_update_types(),
             )
         finally:
-            await scheduler.stop()
-            await bot.session.close()
+            try:
+                if scheduler is not None:
+                    await scheduler.stop()
+            finally:
+                try:
+                    if bot is not None:
+                        await bot.session.close()
+                finally:
+                    await database.close()
 
 
 def main() -> None:

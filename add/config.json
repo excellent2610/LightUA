@@ -1,6 +1,8 @@
 {
   "ads_enabled": false,
   "show_every": 5,
+  "max_per_user_per_day": 3,
+  "min_interval_hours": 4,
 
   "ads": [
     {

@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 def get_router(db: Database, parser: AlertsParser | None = None) -> Router:
     router = Router(name="status")
-    ad_manager = get_ad_manager()
+    ad_manager = get_ad_manager(db=db)
 
     @router.message(Command("status"), StateFilter("*"))
     async def status_command(message: Message) -> None:
@@ -30,6 +30,7 @@ def get_router(db: Database, parser: AlertsParser | None = None) -> Router:
                 message.bot,
                 message.chat.id,
                 "Ви ще не зареєстровані. Використайте /register",
+                telegram_id=message.from_user.id,
             )
             return
 
@@ -48,6 +49,7 @@ def get_router(db: Database, parser: AlertsParser | None = None) -> Router:
             message.bot,
             message.chat.id,
             text,
+            telegram_id=message.from_user.id,
         )
 
     return router

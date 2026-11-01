@@ -17,6 +17,7 @@ from bs4 import BeautifulSoup
 
 KYIV = ZoneInfo("Europe/Kyiv")
 NOW = datetime(2026, 10, 17, 12, 0, tzinfo=KYIV)
+FINAL_NOTICE_MARKER = "більше запланованих відключень світла немає"
 
 
 def make_user(user_id: int, region: str = "region-a", queue: int = 2, subqueue: int = 1) -> User:
@@ -181,7 +182,7 @@ class FakeBot:
     async def send_message(self, **kwargs: object) -> None:
         message = str(kwargs.get("text", ""))
         if self.failure is not None and (
-            "більше немає запланованих" in message or "☀️ Графік відключень" in message
+            FINAL_NOTICE_MARKER in message or "☀️ Графік відключень" in message
             or "🔄 Графік оновлено!" in message
         ):
             failure, self.failure = self.failure, None
@@ -661,7 +662,7 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
 
         await self._run_end_of_day(schedule)
 
-        finals = [m for m in self.bot.messages if "більше немає запланованих" in str(m["text"])]
+        finals = [m for m in self.bot.messages if FINAL_NOTICE_MARKER in str(m["text"])]
         self.assertEqual(len(finals), 1)
 
     async def test_future_outage_prevents_final_notice(self) -> None:
@@ -673,7 +674,7 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
 
         await self._run_end_of_day(schedule)
 
-        self.assertFalse(any("більше немає запланованих" in str(m["text"]) for m in self.bot.messages))
+        self.assertFalse(any(FINAL_NOTICE_MARKER in str(m["text"]) for m in self.bot.messages))
 
     async def test_schedule_without_outages_does_not_create_false_final_notice(self) -> None:
         schedule = DaySchedule(
@@ -684,7 +685,7 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
 
         await self._run_end_of_day(schedule)
 
-        self.assertFalse(any("більше немає запланованих" in str(m["text"]) for m in self.bot.messages))
+        self.assertFalse(any(FINAL_NOTICE_MARKER in str(m["text"]) for m in self.bot.messages))
 
     async def test_stale_or_undated_source_does_not_send_final_notice(self) -> None:
         stale = DaySchedule(
@@ -701,7 +702,7 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
         await self._run_end_of_day(stale)
         await self._run_end_of_day(undated)
 
-        self.assertFalse(any("більше немає запланованих" in str(m["text"]) for m in self.bot.messages))
+        self.assertFalse(any(FINAL_NOTICE_MARKER in str(m["text"]) for m in self.bot.messages))
 
     async def test_parser_error_does_not_send_final_notice(self) -> None:
         self.parser.schedules[("region-a", 2, 1)] = ParserError("source unavailable")
@@ -725,7 +726,7 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
         with patch("bot.scheduler.now_kyiv", return_value=NOW):
             await restarted._check_user(user, schedule, "on", NOW)
 
-        finals = [m for m in self.bot.messages if "більше немає запланованих" in str(m["text"])]
+        finals = [m for m in self.bot.messages if FINAL_NOTICE_MARKER in str(m["text"])]
         self.assertEqual(len(finals), 1)
 
     async def test_parallel_claims_send_at_most_one_final_notice(self) -> None:
@@ -745,7 +746,7 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
                                   second_scheduler, self.scheduler)
             ])
 
-        finals = [m for m in self.bot.messages if "більше немає запланованих" in str(m["text"])]
+        finals = [m for m in self.bot.messages if FINAL_NOTICE_MARKER in str(m["text"])]
         self.assertEqual(len(finals), 1)
 
     async def test_midnight_interval_and_new_date_fail_closed(self) -> None:
@@ -794,13 +795,13 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
     async def test_end_of_day_notice_is_profile_scoped(self) -> None:
         self.parser.schedules[("region-a", 2, 1)] = DaySchedule(
             "region-a", "region-a", 2, 1,
-            [ScheduleInterval(time(8), time(10), "off")],
+            [ScheduleInterval(time(10), time(12), "off")],
             schedule_date=NOW.date(), fetched_at=NOW - timedelta(minutes=10), source_updated_at=NOW - timedelta(minutes=10),
         )
 
         await self._check(self.scheduler)
 
-        finals = [m["chat_id"] for m in self.bot.messages if "більше немає запланованих" in str(m["text"])]
+        finals = [m["chat_id"] for m in self.bot.messages if FINAL_NOTICE_MARKER in str(m["text"])]
         self.assertEqual(finals, [11, 12])
 
     async def test_confirmed_telegram_error_can_retry_and_success_marks_sent(self) -> None:
@@ -818,7 +819,7 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
         self.db.monotonic += 300
         await self._run_end_of_day(schedule)
         self.assertEqual(self.db.final_events[key]["status"], "sent")
-        self.assertEqual(sum("більше немає запланованих" in str(m["text"]) for m in self.bot.messages), 1)
+        self.assertEqual(sum(FINAL_NOTICE_MARKER in str(m["text"]) for m in self.bot.messages), 1)
 
     async def test_ambiguous_timeout_is_not_retried(self) -> None:
         user = self.users[0]
@@ -830,7 +831,7 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
         event = next(iter(self.db.final_events.values()))
         self.assertEqual(event["status"], "unknown")
         await self._run_end_of_day(schedule)
-        self.assertEqual(sum("більше немає запланованих" in str(m["text"]) for m in self.bot.messages), 0)
+        self.assertEqual(sum(FINAL_NOTICE_MARKER in str(m["text"]) for m in self.bot.messages), 0)
 
     async def test_a_b_a_event_sequence_is_deduplicated_by_history(self) -> None:
         user = self.users[0]
@@ -1242,7 +1243,7 @@ class ScheduleNotificationTests(unittest.IsolatedAsyncioTestCase):
         await self._run_end_of_day(schedule)
         await self._run_end_of_day(schedule)
 
-        finals = [m for m in self.bot.messages if "більше немає запланованих" in str(m["text"])]
+        finals = [m for m in self.bot.messages if FINAL_NOTICE_MARKER in str(m["text"])]
         self.assertEqual(len(finals), 1)
 
     async def test_morning_schedule_is_sent_at_0700(self) -> None:

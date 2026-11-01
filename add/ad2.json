@@ -1,4 +1,7 @@
 {
+  "id": "ad2",
+  "name": "Рекламна кампанія 2",
+  "enabled": true,
   "text": "Реклама 2",
   "button_text": "Перейти",
   "url": "https://example.com"

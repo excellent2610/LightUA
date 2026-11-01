@@ -92,7 +92,7 @@ def _build_notify_on_text(
 
 def get_router(db: Database) -> Router:
     router = Router(name="notify")
-    ad_manager = get_ad_manager()
+    ad_manager = get_ad_manager(db=db)
 
     @router.message(Command("help"), StateFilter("*"))
     async def help_command(message: Message) -> None:
@@ -107,7 +107,10 @@ def get_router(db: Database) -> Router:
             "/notify_test - тест сповіщення через 5 хв\n"
             "/quiet - налаштувати тиху годину\n"
             "/status - переглянути профіль\n"
-            "/help - показати цю довідку"
+            "/help - показати цю довідку",
+            telegram_id=(
+                message.from_user.id if message.from_user is not None else message.chat.id
+            ),
         )
 
     @router.message(Command("notify_on"), StateFilter("*"))
@@ -121,6 +124,7 @@ def get_router(db: Database) -> Router:
                 message.bot,
                 message.chat.id,
                 "Спочатку завершіть реєстрацію: /s",
+                telegram_id=message.from_user.id,
             )
             return
 
@@ -129,6 +133,7 @@ def get_router(db: Database) -> Router:
             await ad_manager.send_with_ad(
                 message.bot, message.chat.id,
                 "Не вдалося оновити налаштування. Спробуй ще раз: /notify_on",
+                telegram_id=message.from_user.id,
             )
             return
 
@@ -152,7 +157,8 @@ def get_router(db: Database) -> Router:
                     queue=user.queue,
                     subqueue=user.subqueue,
                     full_graph_text=full_graph_text,
-                )
+                ),
+                telegram_id=user.telegram_id,
             )
         except EmergencyOutageError:
             await ad_manager.send_with_ad(
@@ -162,7 +168,8 @@ def get_router(db: Database) -> Router:
                 f"{user.region_name} · Черга {user.queue}.{user.subqueue}\n"
                 "Попередження за 5 хв.\n\n"
                 "Найближче попередження:\n"
-                "Недоступно через аварійні відключення"
+                "Недоступно через аварійні відключення",
+                telegram_id=user.telegram_id,
             )
         except (ScheduleNotFoundError, RegionUnavailableError):
             await ad_manager.send_with_ad(
@@ -172,7 +179,8 @@ def get_router(db: Database) -> Router:
                 f"{user.region_name} · Черга {user.queue}.{user.subqueue}\n"
                 "Попередження за 5 хв.\n\n"
                 "Найближче попередження:\n"
-                "Недоступно, спробуйте /graph пізніше"
+                "Недоступно, спробуйте /graph пізніше",
+                telegram_id=user.telegram_id,
             )
         except Exception:
             logger.exception("Failed to build next warning in /notify_on")
@@ -181,7 +189,8 @@ def get_router(db: Database) -> Router:
                 message.chat.id,
                 "🔔 Сповіщення увімкнено.\n"
                 f"{user.region_name} · Черга {user.queue}.{user.subqueue}\n"
-                "Попередження за 5 хв."
+                "Попередження за 5 хв.",
+                telegram_id=user.telegram_id,
             )
 
     @router.message(Command("notify_test"), StateFilter("*"))
@@ -195,6 +204,7 @@ def get_router(db: Database) -> Router:
                 message.bot,
                 message.chat.id,
                 "Спочатку завершіть реєстрацію: /start",
+                telegram_id=message.from_user.id,
             )
             return
 
@@ -202,6 +212,7 @@ def get_router(db: Database) -> Router:
             message.bot,
             message.chat.id,
             "🧪 Тест заплановано. Тестове повідомлення прийде через 5 хвилин.",
+            telegram_id=user.telegram_id,
         )
 
         async def send_delayed_test() -> None:
@@ -215,6 +226,7 @@ def get_router(db: Database) -> Router:
                     f"{user.region_name} · Черга {user.queue}.{user.subqueue}\n"
                     "Затримка: 5 хв"
                 ),
+                telegram_id=user.telegram_id,
             )
 
         asyncio.create_task(send_delayed_test())
@@ -230,6 +242,7 @@ def get_router(db: Database) -> Router:
                 message.bot,
                 message.chat.id,
                 "Спочатку завершіть реєстрацію: /start",
+                telegram_id=message.from_user.id,
             )
             return
 
@@ -238,12 +251,14 @@ def get_router(db: Database) -> Router:
             await ad_manager.send_with_ad(
                 message.bot, message.chat.id,
                 "Не вдалося оновити налаштування. Спробуй ще раз: /notify_off",
+                telegram_id=message.from_user.id,
             )
             return
         await ad_manager.send_with_ad(
             message.bot,
             message.chat.id,
             "🔕 Сповіщення вимкнено\n\nГрафік і стан можна переглянути: /graph · /status",
+            telegram_id=message.from_user.id,
         )
 
     return router
