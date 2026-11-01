@@ -115,16 +115,32 @@ async def send_graph_for_user(
         return
 
     try:
-        schedule = await asyncio.to_thread(
-            parser.get_schedule,
-            user.region_slug,
-            user.queue,
-            user.subqueue,
-        )
+        try:
+            schedule = await asyncio.to_thread(
+                parser.get_schedule,
+                user.region_slug,
+                user.queue,
+                user.subqueue,
+            )
+        except RegionUnavailableError:
+            schedule = await asyncio.to_thread(
+                parser.get_cached_schedule,
+                user.region_slug,
+                user.queue,
+                user.subqueue,
+            )
+            if schedule is None:
+                raise
+            logger.warning(
+                "Using cached graph after source outage for profile=(%s, %s.%s)",
+                user.region_slug,
+                user.queue,
+                user.subqueue,
+            )
         schedule.region_name = user.region_name
         current_state = schedule.state_at(now_kyiv())
         full_graph_text = format_graph_message(schedule=schedule, current_state=current_state, now=now_kyiv())
-        if compact:
+        if compact and not schedule.stale:
             compact_messages = _build_compact_graph_messages(full_graph_text=full_graph_text, current_state=current_state)
             if compact_messages:
                 for text in compact_messages:

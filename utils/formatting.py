@@ -76,6 +76,8 @@ def format_graph_message(schedule: "DaySchedule", current_state: str, now: datet
                 next_event = min(upcoming)
                 action = "відключення" if current_state == "on" else "відновлення світла"
                 lines.append(f"Найближче {action} — о {next_event:%H:%M}.")
+    if schedule.stale:
+        lines.extend(["", "⚠️ Показано кешований графік. Дані можуть бути неактуальними."])
     lines.extend(["", "Джерело: alerts.org.ua"])
     return "\n".join(lines)
 

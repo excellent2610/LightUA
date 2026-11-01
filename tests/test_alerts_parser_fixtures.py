@@ -3,8 +3,10 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, time
 from pathlib import Path
+from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
+import requests
 from bs4 import BeautifulSoup
 
 from parsing.alerts_parser import (
@@ -28,6 +30,46 @@ class AlertsParserFixtureTests(unittest.TestCase):
     def _read(self, name: str) -> tuple[BeautifulSoup, str]:
         soup = BeautifulSoup((FIXTURES / name).read_text(encoding="utf-8"), "html.parser")
         return soup, soup.get_text("\n", strip=True)
+
+    def test_temporary_timeout_is_retried(self) -> None:
+        parser = AlertsParser()
+        response = Mock()
+        response.text = "page"
+        parser._session.get = Mock(side_effect=[requests.Timeout(), response])
+
+        with patch("parsing.alerts_parser.sleep") as sleep:
+            self.assertEqual(parser._fetch_url("https://alerts.org.ua/kyiv/"), "page")
+
+        self.assertEqual(parser._session.get.call_count, 2)
+        sleep.assert_called_once_with(0.5)
+
+    def test_successful_page_is_cached_for_repeat_requests(self) -> None:
+        parser = AlertsParser()
+        response = Mock()
+        response.text = "page"
+        parser._session.get = Mock(return_value=response)
+
+        url = "https://alerts.org.ua/cherkaska-oblast/"
+        self.assertEqual(parser._fetch_url(url), "page")
+        self.assertEqual(parser._fetch_url(url), "page")
+
+        parser._session.get.assert_called_once_with(url, timeout=15)
+
+    def test_same_day_schedule_is_available_as_stale_fallback(self) -> None:
+        parser = AlertsParser()
+        today = datetime.now(ZoneInfo("Europe/Kyiv")).strftime("%d.%m.%Y")
+        parser._fetch_url = lambda _url: (
+            f"<title>Черкаська область графік {today}</title>"
+            "<b>Група 1</b><div>00:00 - 24:00 ON</div>"
+        )
+
+        schedule = parser.get_schedule("cherkaska-oblast", 1, 1)
+        cached = parser.get_cached_schedule("cherkaska-oblast", 1, 1)
+
+        self.assertIsNotNone(cached)
+        self.assertFalse(schedule.stale)
+        self.assertTrue(cached.stale)
+        self.assertEqual(cached.schedule_date, schedule.schedule_date)
 
     def test_current_real_page_parses_flat_group_1_and_group_2(self) -> None:
         soup, text = self._read("kyiv-current.html")

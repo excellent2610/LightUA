@@ -53,6 +53,12 @@ class FormattingTests(unittest.TestCase):
         self.assertIn("Інтервали графіка відсутні", text)
         self.assertNotIn("Зараз світло", text)
 
+    def test_stale_graph_is_clearly_marked(self):
+        schedule = DaySchedule("cherkasy", "Черкаська область", 4, 2, [], stale=True)
+        text = format_graph_message(schedule, "unknown")
+        self.assertIn("Показано кешований графік", text)
+        self.assertIn("Дані можуть бути неактуальними", text)
+
     def test_status_displays_compact_queue_and_cross_midnight_quiet_hours(self):
         user = User(1, "cherkasy", "Черкаська область", 4, 2, True, "23:00", "07:00")
         text = format_status_message(user)

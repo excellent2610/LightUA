@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import re
-import time as time_module
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time
+from threading import Lock
+from time import monotonic, sleep
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -48,6 +49,42 @@ ANTI_BOT_KEYWORDS = (
     "cf-turnstile",
     "attention required",
 )
+PAGE_CACHE_TTL_SECONDS = 15
+PAGE_CACHE_MAX_ENTRIES = 128
+REQUEST_LOCK_COUNT = 4
+SCHEDULE_CACHE_MAX_AGE_SECONDS = 900
+SCHEDULE_CACHE_MAX_ENTRIES = 512
+LEGACY_REGION_SLUGS = {
+    "volynska": "volynska-oblast",
+    "vinnytska": "vinnytcka-oblast",
+    "dnipropetrovska": "dnipropetrovska-oblast",
+    "donetska": "donetcka-oblast",
+    "zhytomyrska": "zhytomyrska-oblast",
+    "zakarpatska": "zakarpatska-oblast",
+    "zaporizka": "zaporizka-oblast",
+    "kyivska": "kyivska-oblast",
+    "kirovogradska": "kirovogradska-oblast",
+    "luganska": "luganska-oblast",
+    "lvivska": "lvivska-oblast",
+    "mykolaivska": "mykolaivska-oblast",
+    "odeska": "odeska-oblast",
+    "poltavska": "poltavska-oblast",
+    "rivnenska": "rivnenska-oblast",
+    "sumska": "sumska-oblast",
+    "ternopilska": "ternopilska-oblast",
+    "harkivska": "harkivska-oblast",
+    "hersonska": "hersonska-oblast",
+    "hmelnitska": "hmelnitcka-oblast",
+    "cherkaska": "cherkaska-oblast",
+    "chernivetska": "chernivetcka-oblast",
+    "chernihivska": "chernigivska-oblast",
+    "ivano-frankivska": "ivano-frankivska-oblast",
+}
+
+
+def _normalize_region_slug(region_slug: str) -> str:
+    normalized = region_slug.strip().strip("/")
+    return LEGACY_REGION_SLUGS.get(normalized, normalized)
 
 
 class ParserError(Exception):
@@ -87,6 +124,7 @@ class DaySchedule:
     fetched_at: datetime | None = None
     source_updated_at: datetime | None = None
     confirmed_empty: bool = False
+    stale: bool = False
 
     def state_at(self, moment: datetime) -> str:
         local_time = moment.astimezone(KYIV_TZ).time()
@@ -104,6 +142,11 @@ class DaySchedule:
 class AlertsParser:
     def __init__(self, timeout_seconds: int = 15) -> None:
         self.timeout_seconds = timeout_seconds
+        self._page_cache: dict[str, tuple[float, str]] = {}
+        self._page_cache_lock = Lock()
+        self._schedule_cache: dict[tuple[str, int, int], tuple[float, DaySchedule]] = {}
+        self._schedule_cache_lock = Lock()
+        self._request_locks = [Lock() for _ in range(REQUEST_LOCK_COUNT)]
         self._session = requests.Session()
         self._session.headers.update(
             {
@@ -115,36 +158,7 @@ class AlertsParser:
         )
 
     def get_schedule(self, region_slug: str, queue: int, subqueue: int) -> DaySchedule:
-        region_slug = region_slug.strip().strip("/")
-
-        # Backward compatibility with legacy region slugs.
-        legacy_slugs = {
-            "volynska": "volynska-oblast",
-            "vinnytska": "vinnytcka-oblast",
-            "dnipropetrovska": "dnipropetrovska-oblast",
-            "donetska": "donetcka-oblast",
-            "zhytomyrska": "zhytomyrska-oblast",
-            "zakarpatska": "zakarpatska-oblast",
-            "zaporizka": "zaporizka-oblast",
-            "kyivska": "kyivska-oblast",
-            "kirovogradska": "kirovogradska-oblast",
-            "luganska": "luganska-oblast",
-            "lvivska": "lvivska-oblast",
-            "mykolaivska": "mykolaivska-oblast",
-            "odeska": "odeska-oblast",
-            "poltavska": "poltavska-oblast",
-            "rivnenska": "rivnenska-oblast",
-            "sumska": "sumska-oblast",
-            "ternopilska": "ternopilska-oblast",
-            "harkivska": "harkivska-oblast",
-            "hersonska": "hersonska-oblast",
-            "hmelnitska": "hmelnitcka-oblast",
-            "cherkaska": "cherkaska-oblast",
-            "chernivetska": "chernivetcka-oblast",
-            "chernihivska": "chernigivska-oblast",
-            "ivano-frankivska": "ivano-frankivska-oblast",
-        }
-        region_slug = legacy_slugs.get(region_slug, region_slug)
+        region_slug = _normalize_region_slug(region_slug)
         region_url = f"{BASE_URL}/{region_slug}/"
 
         html = self._fetch_url(region_url)
@@ -193,7 +207,7 @@ class AlertsParser:
 
         region_name = self._extract_region_name(source_soup, region_slug)
         schedule_date = _extract_schedule_date(source_soup, source_url)
-        return DaySchedule(
+        schedule = DaySchedule(
             region_slug=region_slug,
             region_name=region_name,
             queue=queue,
@@ -206,6 +220,30 @@ class AlertsParser:
             source_updated_at=_extract_source_updated_at(source_soup),
             confirmed_empty=confirmed_empty,
         )
+        self._remember_schedule(schedule)
+        return schedule
+
+    def get_cached_schedule(self, region_slug: str, queue: int, subqueue: int) -> DaySchedule | None:
+        key = (_normalize_region_slug(region_slug), queue, subqueue)
+        with self._schedule_cache_lock:
+            cached = self._schedule_cache.get(key)
+        if cached is None:
+            return None
+
+        cached_at, schedule = cached
+        if monotonic() - cached_at > SCHEDULE_CACHE_MAX_AGE_SECONDS:
+            return None
+        if schedule.schedule_date is None or schedule.schedule_date < now_kyiv().date():
+            return None
+        return replace(schedule, stale=True)
+
+    def _remember_schedule(self, schedule: DaySchedule) -> None:
+        key = (schedule.region_slug, schedule.queue, schedule.subqueue)
+        with self._schedule_cache_lock:
+            if len(self._schedule_cache) >= SCHEDULE_CACHE_MAX_ENTRIES:
+                oldest_key = next(iter(self._schedule_cache))
+                del self._schedule_cache[oldest_key]
+            self._schedule_cache[key] = (monotonic(), replace(schedule))
 
     def get_current_state(
         self,
@@ -222,24 +260,43 @@ class AlertsParser:
         return state, schedule
 
     def _fetch_url(self, url: str) -> str:
-        last_error: requests.RequestException | None = None
+        request_lock = self._request_locks[hash(url) % len(self._request_locks)]
+        with request_lock:
+            now = monotonic()
+            with self._page_cache_lock:
+                cached_page = self._page_cache.get(url)
+                if cached_page is not None:
+                    expires_at, html = cached_page
+                    if now < expires_at:
+                        return html
+                    del self._page_cache[url]
 
-        for attempt in range(3):
-            try:
-                response = self._session.get(
-                    url,
-                    timeout=self.timeout_seconds,
-                )
-                response.raise_for_status()
-                return response.text
-            except requests.RequestException as exc:
-                last_error = exc
-                if attempt < 2:
-                    time_module.sleep(1 + attempt)
-
-        raise RegionUnavailableError(
-            f"Не вдалося отримати сторінку після 3 спроб: {url}"
-        ) from last_error
+            for attempt in range(3):
+                try:
+                    response = self._session.get(url, timeout=self.timeout_seconds)
+                    response.raise_for_status()
+                    html = response.text
+                    with self._page_cache_lock:
+                        now = monotonic()
+                        expired_urls = [
+                            cached_url
+                            for cached_url, (expires_at, _) in self._page_cache.items()
+                            if now >= expires_at
+                        ]
+                        for cached_url in expired_urls:
+                            del self._page_cache[cached_url]
+                        while len(self._page_cache) >= PAGE_CACHE_MAX_ENTRIES:
+                            self._page_cache.pop(next(iter(self._page_cache)))
+                        self._page_cache[url] = (now + PAGE_CACHE_TTL_SECONDS, html)
+                    return html
+                except requests.RequestException as exc:
+                    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                    retryable = isinstance(exc, (requests.ConnectionError, requests.Timeout)) or (
+                        status_code == 429 or (status_code is not None and status_code >= 500)
+                    )
+                    if not retryable or attempt == 2:
+                        raise RegionUnavailableError(f"Не вдалося отримати сторінку: {url}") from exc
+                    sleep(0.5 * (attempt + 1))
 
     def _find_latest_schedule_url(
         self,
