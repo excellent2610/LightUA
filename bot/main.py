@@ -6,10 +6,14 @@ import os
 import sys
 from contextlib import contextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from aiohttp import web
 from aiogram import Bot
 from aiogram.types import BotCommand
+
+if TYPE_CHECKING:
+    from bot.shadow_scheduler import ShadowScheduleScheduler
 
 try:
     from bot.config import load_settings
@@ -156,11 +160,18 @@ async def run() -> None:
     logger.info("Using DB path: %s", settings.db_path)
 
     lock_path = Path(settings.db_path).with_suffix(".lock")
+    shadow_sources = {
+        "alerts_energy": settings.shadow_alerts_energy_enabled,
+        "kolysvitlo": settings.shadow_kolysvitlo_enabled,
+        "alerts_org": settings.shadow_alerts_org_enabled,
+    }
+    shadow_enabled = settings.shadow_mode_enabled and any(shadow_sources.values())
 
     with single_instance_lock(lock_path):
-        database = Database(settings.db_path)
+        database = Database(settings.db_path, shadow_enabled=shadow_enabled)
         bot: Bot | None = None
         scheduler: LightStateScheduler | None = None
+        shadow_scheduler: ShadowScheduleScheduler | None = None
         try:
             await database.init()
             parser = AlertsParser(timeout_seconds=settings.request_timeout_seconds)
@@ -172,9 +183,26 @@ async def run() -> None:
                 parser=parser,
                 interval_seconds=settings.poll_interval_seconds,
             )
+            if shadow_enabled and database.shadow_schema_ready:
+                from bot.shadow_scheduler import ShadowScheduleScheduler
+                from parsing.source_manager import SourceScheduleManager
+
+                source_manager = SourceScheduleManager(
+                    database,
+                    enabled_sources=shadow_sources,
+                    timeout_seconds=settings.shadow_request_timeout_seconds,
+                )
+                shadow_scheduler = ShadowScheduleScheduler(source_manager)
+            elif shadow_enabled:
+                logger.error(
+                    "Shadow monitoring is enabled but its database schema is unavailable; "
+                    "continuing without shadow polling"
+                )
 
             # Start the application services only after cleanup is guaranteed.
             await scheduler.start()
+            if shadow_scheduler is not None:
+                await shadow_scheduler.start()
             await start_web_server(database)
 
             await bot.delete_webhook(drop_pending_updates=True)
@@ -186,14 +214,18 @@ async def run() -> None:
             )
         finally:
             try:
-                if scheduler is not None:
-                    await scheduler.stop()
+                if shadow_scheduler is not None:
+                    await shadow_scheduler.stop()
             finally:
                 try:
-                    if bot is not None:
-                        await bot.session.close()
+                    if scheduler is not None:
+                        await scheduler.stop()
                 finally:
-                    await database.close()
+                    try:
+                        if bot is not None:
+                            await bot.session.close()
+                    finally:
+                        await database.close()
 
 
 def main() -> None:

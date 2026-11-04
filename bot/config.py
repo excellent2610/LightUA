@@ -16,6 +16,23 @@ class Settings:
     poll_interval_seconds: int
     request_timeout_seconds: int
     log_level: str
+    shadow_mode_enabled: bool = False
+    shadow_alerts_energy_enabled: bool = False
+    shadow_kolysvitlo_enabled: bool = False
+    shadow_alerts_org_enabled: bool = False
+    shadow_request_timeout_seconds: int = 15
+
+
+def _read_bool(name: str, *, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value")
 
 
 def load_settings() -> Settings:
@@ -33,10 +50,28 @@ def load_settings() -> Settings:
     db_path = db_path.resolve()
     poll_interval_seconds = int(os.getenv("POLL_INTERVAL_SECONDS", "5"))
     request_timeout_seconds = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "15"))
+    shadow_request_timeout_seconds = int(
+        os.getenv("SHADOW_REQUEST_TIMEOUT_SECONDS", "15")
+    )
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    shadow_mode_enabled = _read_bool("SHADOW_MODE_ENABLED", default=False)
+    shadow_alerts_energy_enabled = _read_bool(
+        "SHADOW_ALERTS_ENERGY_ENABLED",
+        default=False,
+    )
+    shadow_kolysvitlo_enabled = _read_bool(
+        "SHADOW_KOLYSVITLO_ENABLED",
+        default=False,
+    )
+    shadow_alerts_org_enabled = _read_bool(
+        "SHADOW_ALERTS_ORG_ENABLED",
+        default=False,
+    )
 
     if poll_interval_seconds < 1:
         raise ValueError("POLL_INTERVAL_SECONDS must be >= 1")
+    if shadow_request_timeout_seconds < 1:
+        raise ValueError("SHADOW_REQUEST_TIMEOUT_SECONDS must be >= 1")
 
     return Settings(
         bot_token=bot_token,
@@ -44,4 +79,9 @@ def load_settings() -> Settings:
         poll_interval_seconds=poll_interval_seconds,
         request_timeout_seconds=request_timeout_seconds,
         log_level=log_level,
+        shadow_mode_enabled=shadow_mode_enabled,
+        shadow_alerts_energy_enabled=shadow_alerts_energy_enabled,
+        shadow_kolysvitlo_enabled=shadow_kolysvitlo_enabled,
+        shadow_alerts_org_enabled=shadow_alerts_org_enabled,
+        shadow_request_timeout_seconds=shadow_request_timeout_seconds,
     )

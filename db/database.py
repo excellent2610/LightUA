@@ -7,7 +7,7 @@ import os
 import random
 import secrets
 import uuid
-from datetime import datetime, time
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Optional
 
@@ -28,6 +28,7 @@ from db.models import (
     ScheduleChangeDelivery,
     User,
 )
+from parsing.models import FetchStatus, ScheduleInterval, SourceScheduleObservation
 from utils.time_utils import KYIV_TZ
 
 logger = logging.getLogger(__name__)
@@ -92,6 +93,47 @@ CREATE TABLE IF NOT EXISTS schedule_snapshots (
     PRIMARY KEY (region_slug, queue, subqueue)
 )
 """
+
+SOURCE_SCHEDULE_OBSERVATIONS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS source_schedule_observations (
+    id BIGSERIAL PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    region_slug TEXT NOT NULL,
+    operator_id TEXT,
+    queue INTEGER NOT NULL,
+    subqueue INTEGER NOT NULL,
+    schedule_date DATE,
+    observed_at TIMESTAMPTZ NOT NULL,
+    source_updated_at TIMESTAMPTZ,
+    fetch_status TEXT NOT NULL CHECK (
+        fetch_status IN ('success', 'incomplete', 'unavailable', 'error')
+    ),
+    intervals_json TEXT,
+    content_hash TEXT,
+    source_url TEXT,
+    error_code TEXT,
+    retry_after_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+"""
+
+SOURCE_SCHEDULE_OBSERVATIONS_CONTENT_HASH_MIGRATION_SQL = (
+    "ALTER TABLE source_schedule_observations "
+    "ADD COLUMN IF NOT EXISTS content_hash TEXT"
+)
+
+SOURCE_SCHEDULE_OBSERVATIONS_RETRY_AFTER_MIGRATION_SQL = (
+    "ALTER TABLE source_schedule_observations "
+    "ADD COLUMN IF NOT EXISTS retry_after_at TIMESTAMPTZ"
+)
+
+SOURCE_SCHEDULE_OBSERVATIONS_INDEXES_SQL = (
+    "CREATE INDEX IF NOT EXISTS source_schedule_observations_source_time_idx "
+    "ON source_schedule_observations (source_id, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS source_schedule_observations_lookup_idx "
+    "ON source_schedule_observations "
+    "(source_id, region_slug, operator_id, queue, subqueue, schedule_date, observed_at DESC)",
+)
 
 NO_OUTAGE_EVENTS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS no_outage_notification_events (
@@ -174,9 +216,11 @@ FROM impression_stats i CROSS JOIN click_stats k
 
 
 class Database:
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(self, db_path: str | Path, *, shadow_enabled: bool = False) -> None:
         self._database_url = os.getenv("DATABASE_URL", "").strip()
         self._db_path = "lightua_postgres"
+        self._shadow_enabled = shadow_enabled
+        self._shadow_schema_ready = False
         self._pool: asyncpg.Pool | None = None
         self._write_lock = asyncio.Lock()
         self._ad_click_secret: bytes | None = None
@@ -185,6 +229,10 @@ class Database:
     @property
     def db_path(self) -> str:
         return "lightua_postgres"
+
+    @property
+    def shadow_schema_ready(self) -> bool:
+        return self._shadow_schema_ready
 
     async def init(self) -> None:
         if not self._database_url:
@@ -203,6 +251,24 @@ class Database:
                 "ALTER TABLE last_state ADD COLUMN IF NOT EXISTS last_no_outages_event_key TEXT"
             )
             await connection.execute(SCHEDULE_SNAPSHOT_TABLE_SQL)
+            if self._shadow_enabled:
+                try:
+                    await connection.execute(SOURCE_SCHEDULE_OBSERVATIONS_TABLE_SQL)
+                    await connection.execute(
+                        SOURCE_SCHEDULE_OBSERVATIONS_CONTENT_HASH_MIGRATION_SQL
+                    )
+                    await connection.execute(
+                        SOURCE_SCHEDULE_OBSERVATIONS_RETRY_AFTER_MIGRATION_SQL
+                    )
+                    for statement in SOURCE_SCHEDULE_OBSERVATIONS_INDEXES_SQL:
+                        await connection.execute(statement)
+                except Exception:
+                    logger.exception(
+                        "Shadow observation schema initialization failed; "
+                        "the bot will run without shadow monitoring"
+                    )
+                else:
+                    self._shadow_schema_ready = True
             for statement in (
                 "ALTER TABLE schedule_snapshots ADD COLUMN IF NOT EXISTS logical_date DATE",
                 "ALTER TABLE schedule_snapshots ADD COLUMN IF NOT EXISTS observed_date DATE",
@@ -677,6 +743,124 @@ class Database:
                         schedule_json,
                     )
                     return previous
+
+    async def record_source_schedule_observation(
+        self,
+        observation: SourceScheduleObservation,
+    ) -> int:
+        """Append one source fetch attempt without touching user schedule snapshots."""
+        import json
+
+        pool = self._require_pool()
+        intervals_json = (
+            json.dumps(
+                [
+                    {
+                        "start_minute": interval.start_minute,
+                        "end_minute": interval.end_minute,
+                        "state": interval.state,
+                    }
+                    for interval in observation.intervals
+                ],
+                separators=(",", ":"),
+            )
+            if observation.fetch_status.value == "success"
+            else None
+        )
+        async with pool.acquire() as connection:
+            observation_id = await connection.fetchval(
+                """INSERT INTO source_schedule_observations
+                   (source_id, region_slug, operator_id, queue, subqueue,
+                    schedule_date, observed_at, source_updated_at, fetch_status,
+                    intervals_json, content_hash, source_url, error_code, retry_after_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                   RETURNING id""",
+                observation.source_id,
+                observation.region_slug,
+                observation.operator_id,
+                observation.queue,
+                observation.subqueue,
+                observation.schedule_date,
+                observation.observed_at,
+                observation.source_updated_at,
+                observation.fetch_status.value,
+                intervals_json,
+                observation.content_hash,
+                observation.source_url,
+                observation.error_code,
+                observation.retry_after_at,
+            )
+        if not isinstance(observation_id, int):
+            raise RuntimeError("Database did not return a source observation ID")
+        return observation_id
+
+    async def get_latest_source_schedule_observation(
+        self,
+        *,
+        source_id: str,
+        region_slug: str,
+        operator_id: str,
+        queue: int,
+        subqueue: int,
+        schedule_date: date,
+    ) -> SourceScheduleObservation | None:
+        import json
+
+        row = await self._fetchone(
+            """SELECT source_id, region_slug, operator_id, queue, subqueue,
+                      schedule_date, observed_at, source_updated_at, fetch_status,
+                      intervals_json, content_hash, source_url, error_code, retry_after_at
+               FROM source_schedule_observations
+               WHERE source_id=$1 AND region_slug=$2 AND operator_id=$3
+                 AND queue=$4 AND subqueue=$5 AND schedule_date=$6
+                 AND fetch_status='success'
+               ORDER BY observed_at DESC, id DESC
+               LIMIT 1""",
+            (source_id, region_slug, operator_id, queue, subqueue, schedule_date),
+        )
+        if row is None:
+            return None
+
+        intervals_payload = json.loads(row["intervals_json"] or "[]")
+        intervals = tuple(
+            ScheduleInterval(
+                start_minute=int(item["start_minute"]),
+                end_minute=int(item["end_minute"]),
+                state=str(item["state"]),
+            )
+            for item in intervals_payload
+        )
+        return SourceScheduleObservation(
+            source_id=row["source_id"],
+            region_slug=row["region_slug"],
+            operator_id=row["operator_id"],
+            queue=row["queue"],
+            subqueue=row["subqueue"],
+            schedule_date=row["schedule_date"],
+            observed_at=row["observed_at"],
+            source_updated_at=row["source_updated_at"],
+            fetch_status=FetchStatus(row["fetch_status"]),
+            intervals=intervals,
+            source_url=row["source_url"],
+            error_code=row["error_code"],
+            content_hash=row["content_hash"],
+            retry_after_at=row["retry_after_at"],
+        )
+
+    async def get_latest_source_retry_after(
+        self,
+        *,
+        source_id: str,
+    ) -> datetime | None:
+        row = await self._fetchone(
+            """SELECT retry_after_at
+               FROM source_schedule_observations
+               WHERE source_id=$1
+               ORDER BY id DESC
+               LIMIT 1""",
+            (source_id,),
+        )
+        return row["retry_after_at"] if row is not None else None
 
     async def observe_schedule(
         self, region_slug: str, queue: int, subqueue: int, *, snapshot_json: str,

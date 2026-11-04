@@ -27,7 +27,8 @@ LightUA/
 │   ├── main.py
 │   ├── config.py
 │   ├── dispatcher.py
-│   └── scheduler.py
+│   ├── scheduler.py
+│   └── shadow_scheduler.py
 ├── handlers/
 │   ├── __init__.py
 │   ├── start.py
@@ -40,6 +41,16 @@ LightUA/
 ├── parsing/
 │   ├── __init__.py
 │   ├── alerts_parser.py
+│   ├── alerts_energy.py
+│   ├── kolysvitlo.py
+│   ├── alerts_org.py
+│   ├── base.py
+│   ├── models.py
+│   ├── normalization.py
+│   ├── comparison.py
+│   ├── database_comparison.py
+│   ├── source_manager.py
+│   ├── source_utils.py
 │   └── regions.py
 ├── db/
 │   ├── __init__.py
@@ -83,7 +94,10 @@ python -m bot.main
 - `PUBLIC_BASE_URL` - публічний HTTPS-origin застосунку для відстеження рекламних кліків, наприклад `https://bot.example.com`; HTTP-адреси відхиляються, а без коректного HTTPS кнопки ведуть напряму на URL рекламодавця й кліки не вимірюються
 - `POLL_INTERVAL_SECONDS` - інтервал перевірки стану в секундах (за замовчуванням 5)
 - `REQUEST_TIMEOUT_SECONDS` - timeout HTTP-запитів до `alerts.org.ua`
+- `SHADOW_REQUEST_TIMEOUT_SECONDS` - незалежний timeout HTTP-запитів shadow-джерел (за замовчуванням 15 секунд)
 - `LOG_LEVEL` - рівень логування (`DEBUG`, `INFO`, `WARNING`, `ERROR`)
+- `SHADOW_MODE_ENABLED` - вмикає окремий shadow scheduler (за замовчуванням вимкнений)
+- `SHADOW_ALERTS_ENERGY_ENABLED`, `SHADOW_KOLYSVITLO_ENABLED`, `SHADOW_ALERTS_ORG_ENABLED` - незалежне вмикання кожного джерела; усі за замовчуванням вимкнені
 
 Приклад:
 
@@ -94,6 +108,11 @@ PUBLIC_BASE_URL=
 POLL_INTERVAL_SECONDS=5
 REQUEST_TIMEOUT_SECONDS=15
 LOG_LEVEL=INFO
+SHADOW_MODE_ENABLED=false
+SHADOW_ALERTS_ENERGY_ENABLED=false
+SHADOW_KOLYSVITLO_ENABLED=false
+SHADOW_ALERTS_ORG_ENABLED=false
+SHADOW_REQUEST_TIMEOUT_SECONDS=15
 ```
 
 ## Технічні деталі
@@ -103,6 +122,16 @@ LOG_LEVEL=INFO
 - Токен читається з env (`os.getenv`)
 - Таблиці рекламних кампаній створюються/оновлюються під час `Database.init()`; окрему міграційну команду запускати не потрібно
 - Джерело даних: парсинг `alerts.org.ua` через `requests + BeautifulSoup`
+- Shadow mode записує кожну фактичну спробу нових адаптерів лише в `source_schedule_observations`; cache hit не створює історичний запис. Shadow-таблиця та її additive-міграції створюються лише коли shadow mode і принаймні одне джерело ввімкнені; вимкнений shadow mode не запускає задачу й не додає shadow DDL до старту
+- `content_hash` спостереження — SHA-256 від канонічно відсортованих нормалізованих інтервалів; cache hit не створює новий запис спостереження
+- Джерела опитуються окремо (за замовчуванням кожні 15 хвилин; cache TTL 10 хвилин; мінімальний інтервал між HTTP-запитами 10 секунд). Retry-After для 429/503 зберігається в історії й відновлюється після рестарту; обмеження одного джерела не затримує інші
+- Shadow отримує власний HTTP timeout (`SHADOW_REQUEST_TIMEOUT_SECONDS`), окремий від `REQUEST_TIMEOUT_SECONDS` основного парсера. Кожне ввімкнене джерело можна незалежно вимкнути
+- Один target на джерело є свідомим поточним обмеженням: конфігурація з кількома target відхиляється, щоб уникнути голодування черг і порівняння різних профілів під одним source ID
+- Порівняння можливе лише коли всі джерела повертають однаковий підтверджений operator ID. Автоматичне зіставлення різних slug/доменів оператора не виконується; без перевіреної alias-мапи результат лишається `not_comparable`
+- Початкові shadow targets обмежені перевіреним профілем Черкаської області, черга 4.2. Наявність маршруту не вважається доказом підтримки всіх черг або операторів
+- Усі записи часу спостереження та Retry-After зберігаються як timezone-aware UTC. Дата графіка та інтервали — локальний календар/час `Europe/Kyiv`; дані, отримані щойно, не вважаються свіжими, якщо `source_updated_at` або дата графіка застарілі
+- Історія append-only не має автоматичного retention. Потрібно окремо визначити політику зберігання перед тривалим production-запуском
+- Shadow тести використовують локальні fixtures і mock HTTP/DB. Реальна доступність сайтів та сумісність схеми з production PostgreSQL мають бути підтверджені окремим staging/canary запуском
 
 ## Реклама
 
